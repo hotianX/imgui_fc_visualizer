@@ -8,6 +8,8 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
+#include <atomic>
 
 #define SOKOL_IMGUI_IMPL
 #include "imgui.h"
@@ -25,13 +27,16 @@
 static bool show_demo_window = false;
 static bool show_visualizer = true;
 
+// Mutex for protecting audio operations
+static std::mutex audio_mutex;
+
 // application state
 static struct {
     sg_pass_action pass_action;
     
     // Game_Music_Emu state
     Music_Emu* emu = nullptr;
-    bool is_playing = false;
+    std::atomic<bool> is_playing{false};
     int current_track = 0;
     int track_count = 0;
     char loaded_file[512] = "";
@@ -45,6 +50,9 @@ static struct {
     float tempo = 1.0f;
     float volume_db = 0.0f;
     
+    // Seek request (set by UI thread, processed by audio thread)
+    std::atomic<long> seek_request{-1};  // -1 means no seek requested
+    
     // Audio visualizer
     AudioVisualizer visualizer;
     
@@ -55,10 +63,18 @@ static struct {
 
 // Audio stream callback - called from audio thread
 void audio_stream_callback(float* buffer, int num_frames, int num_channels, void* user_data) {
-    if (!state.emu || !state.is_playing) {
+    if (!state.emu || !state.is_playing.load()) {
         // Fill with silence
         std::fill(buffer, buffer + num_frames * num_channels, 0.0f);
         return;
+    }
+    
+    std::lock_guard<std::mutex> lock(audio_mutex);
+    
+    // Process seek request if any
+    long seek_pos = state.seek_request.exchange(-1);
+    if (seek_pos >= 0 && state.emu) {
+        gme_seek(state.emu, seek_pos);
     }
     
     // Game_Music_Emu generates 16-bit signed samples (stereo)
@@ -84,13 +100,34 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     }
 }
 
+// Safe track start - can be called from UI thread
+void safe_start_track(int track) {
+    if (!state.emu) return;
+    
+    // Request the audio thread to start the track
+    state.is_playing.store(false);  // Pause playback
+    
+    std::lock_guard<std::mutex> lock(audio_mutex);
+    state.seek_request.store(-1);  // Clear any pending seek
+    gme_start_track(state.emu, track);
+    state.is_playing.store(true);  // Resume playback
+}
+
 void load_nsf_file(const char* path) {
+    // Stop playback first
+    state.is_playing.store(false);
+    
+    // Wait for audio thread to stop using the emulator
+    std::lock_guard<std::mutex> lock(audio_mutex);
+    
     // Clean up previous emulator
     if (state.emu) {
         gme_delete(state.emu);
         state.emu = nullptr;
     }
-    state.is_playing = false;
+    
+    // Reset seek request
+    state.seek_request.store(-1);
     
     // Load new file
     gme_err_t err = gme_open_file(path, &state.emu, state.sample_rate);
@@ -272,44 +309,87 @@ void draw_player_window() {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(200);
         if (ImGui::SliderInt("##track", &state.current_track, 0, state.track_count - 1, "Track %d")) {
-            gme_start_track(state.emu, state.current_track);
-            state.is_playing = true;
+            safe_start_track(state.current_track);
         }
         ImGui::SameLine();
         ImGui::Text("/ %d", state.track_count);
         
-        // Playback position
-        if (state.is_playing) {
+        ImGui::Separator();
+        
+        // Playback position and seek bar
+        {
             long pos = gme_tell(state.emu);
             long length = 0;
             if (gme_track_info(state.emu, &info, state.current_track) == nullptr) {
-                length = info.length > 0 ? info.length : 0;
+                length = info.length > 0 ? info.length : 150000; // Default 2:30 if unknown
+            }
+            if (length <= 0) length = 150000; // Fallback
+            
+            // Format time strings
+            int pos_sec = (pos / 1000) % 60;
+            int pos_min = (pos / 1000) / 60;
+            int len_sec = (length / 1000) % 60;
+            int len_min = (length / 1000) / 60;
+            
+            // Time display: current / total
+            char time_str[64];
+            snprintf(time_str, sizeof(time_str), "%02d:%02d / %02d:%02d", 
+                     pos_min, pos_sec, len_min, len_sec);
+            
+            // Calculate layout
+            float time_width = ImGui::CalcTextSize(time_str).x;
+            float available_width = ImGui::GetContentRegionAvail().x;
+            float slider_width = available_width - time_width - 20;
+            
+            // Progress slider (interactive seek bar)
+            float progress = static_cast<float>(pos) / static_cast<float>(length);
+            progress = std::clamp(progress, 0.0f, 1.0f);
+            
+            ImGui::SetNextItemWidth(slider_width);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.20f, 0.20f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.25f, 0.25f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.50f, 0.70f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.60f, 0.80f, 1.0f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 12.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+            
+            if (ImGui::SliderFloat("##seek", &progress, 0.0f, 1.0f, "")) {
+                // User is seeking - send request to audio thread
+                long new_pos = static_cast<long>(progress * length);
+                state.seek_request.store(new_pos);
             }
             
-            int pos_sec = pos / 1000;
-            int pos_min = pos_sec / 60;
-            pos_sec %= 60;
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(5);
             
-            if (length > 0) {
-                int len_sec = length / 1000;
-                int len_min = len_sec / 60;
-                len_sec %= 60;
-                ImGui::Text("Time: %02d:%02d / %02d:%02d", pos_min, pos_sec, len_min, len_sec);
-                
-                float progress = static_cast<float>(pos) / static_cast<float>(length);
-                ImGui::ProgressBar(progress, ImVec2(-1, 6), "");
-            } else {
-                ImGui::Text("Time: %02d:%02d", pos_min, pos_sec);
-            }
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.7f, 0.8f, 1.0f, 1.0f), "%s", time_str);
+            
+            // Visual progress bar below the slider (filled portion)
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            ImVec2 bar_pos = ImGui::GetCursorScreenPos();
+            bar_pos.y -= 22; // Position it over the slider
+            float bar_height = 4.0f;
+            float filled_width = progress * slider_width;
+            
+            // Draw filled portion with gradient
+            ImU32 color_left = IM_COL32(80, 140, 220, 255);
+            ImU32 color_right = IM_COL32(140, 200, 255, 255);
+            draw_list->AddRectFilledMultiColor(
+                ImVec2(bar_pos.x, bar_pos.y + 8),
+                ImVec2(bar_pos.x + filled_width, bar_pos.y + 8 + bar_height),
+                color_left, color_right, color_right, color_left
+            );
             
             // Check if track ended
-            if (gme_track_ended(state.emu)) {
+            if (state.is_playing.load() && gme_track_ended(state.emu)) {
                 // Auto-advance to next track
                 if (state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    gme_start_track(state.emu, state.current_track);
+                    safe_start_track(state.current_track);
                 } else {
-                    state.is_playing = false;
+                    state.is_playing.store(false);
                 }
             }
         }
@@ -323,28 +403,27 @@ void draw_player_window() {
             if (ImGui::Button("|<", ImVec2(40, 30))) {
                 if (state.current_track > 0) {
                     state.current_track--;
-                    gme_start_track(state.emu, state.current_track);
-                    state.is_playing = true;
+                    safe_start_track(state.current_track);
                 }
             }
             ImGui::SameLine();
             
             // Play/Pause
-            const char* play_label = state.is_playing ? "||" : ">";
+            const char* play_label = state.is_playing.load() ? "||" : ">";
             if (ImGui::Button(play_label, ImVec2(50, 30))) {
-                if (!state.is_playing) {
-                    gme_start_track(state.emu, state.current_track);
-                    state.is_playing = true;
+                if (!state.is_playing.load()) {
+                    safe_start_track(state.current_track);
                 } else {
-                    state.is_playing = false;
+                    state.is_playing.store(false);
                 }
             }
             ImGui::SameLine();
             
             // Stop
             if (ImGui::Button("[]", ImVec2(40, 30))) {
-                state.is_playing = false;
-                gme_start_track(state.emu, state.current_track);
+                state.is_playing.store(false);
+                // Reset to beginning of track
+                state.seek_request.store(0);
             }
             ImGui::SameLine();
             
@@ -352,8 +431,7 @@ void draw_player_window() {
             if (ImGui::Button(">|", ImVec2(40, 30))) {
                 if (state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    gme_start_track(state.emu, state.current_track);
-                    state.is_playing = true;
+                    safe_start_track(state.current_track);
                 }
             }
         }
@@ -457,12 +535,16 @@ void frame(void) {
 
 void cleanup(void) {
     // Stop audio playback
-    state.is_playing = false;
+    state.is_playing.store(false);
     
-    // Cleanup Game_Music_Emu
-    if (state.emu) {
-        gme_delete(state.emu);
-        state.emu = nullptr;
+    // Wait for audio thread to finish
+    {
+        std::lock_guard<std::mutex> lock(audio_mutex);
+        // Cleanup Game_Music_Emu
+        if (state.emu) {
+            gme_delete(state.emu);
+            state.emu = nullptr;
+        }
     }
     
     // Cleanup sokol_audio
@@ -486,11 +568,10 @@ void input(const sapp_event* ev) {
             case SAPP_KEYCODE_SPACE:
                 // Toggle play/pause
                 if (state.emu) {
-                    if (!state.is_playing) {
-                        gme_start_track(state.emu, state.current_track);
-                        state.is_playing = true;
+                    if (!state.is_playing.load()) {
+                        safe_start_track(state.current_track);
                     } else {
-                        state.is_playing = false;
+                        state.is_playing.store(false);
                     }
                 }
                 break;
@@ -499,8 +580,7 @@ void input(const sapp_event* ev) {
                 // Previous track
                 if (state.emu && state.current_track > 0) {
                     state.current_track--;
-                    gme_start_track(state.emu, state.current_track);
-                    state.is_playing = true;
+                    safe_start_track(state.current_track);
                 }
                 break;
                 
@@ -508,8 +588,7 @@ void input(const sapp_event* ev) {
                 // Next track
                 if (state.emu && state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    gme_start_track(state.emu, state.current_track);
-                    state.is_playing = true;
+                    safe_start_track(state.current_track);
                 }
                 break;
                 
