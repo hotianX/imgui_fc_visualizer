@@ -368,45 +368,89 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
     // Background
     draw_list->AddRectFilled(canvas_pos, 
                             ImVec2(canvas_pos.x + width, canvas_pos.y + height),
-                            IM_COL32(25, 25, 30, 255));
+                            IM_COL32(20, 20, 28, 255));
     
-    // Calculate note range
+    // Calculate note range (same as keyboard)
     int start_note = octave_low_ * 12 + 12;
     int end_note = octave_high_ * 12 + 12;
-    int note_range = end_note - start_note + 1;
     
-    float note_height = height / note_range;
-    float time_start = current_time - piano_roll_seconds_;
-    float pixels_per_second = width / piano_roll_seconds_;
-    
-    // Draw horizontal grid lines (for each note)
+    // Count white keys for width calculation
+    int white_key_count = 0;
     for (int note = start_note; note <= end_note; ++note) {
-        float y = canvas_pos.y + (end_note - note) * note_height;
-        ImU32 line_color = isBlackKey(note) ? IM_COL32(35, 35, 40, 255) : IM_COL32(45, 45, 55, 255);
-        draw_list->AddLine(ImVec2(canvas_pos.x, y), 
-                          ImVec2(canvas_pos.x + width, y), line_color);
-        
-        // Highlight C notes
-        if (getNoteInOctave(note) == 0) {
-            draw_list->AddLine(ImVec2(canvas_pos.x, y), 
-                              ImVec2(canvas_pos.x + width, y), 
-                              IM_COL32(60, 60, 70, 255), 2.0f);
+        if (!isBlackKey(note)) white_key_count++;
+    }
+    
+    float white_key_width = width / white_key_count;
+    float black_key_width = white_key_width * 0.65f;
+    
+    // Time flows vertically: top = future, bottom = current (keyboard position)
+    float time_start = current_time - piano_roll_seconds_;
+    float pixels_per_second = height / piano_roll_seconds_;
+    
+    // Draw vertical grid lines for each white key
+    int white_key_idx = 0;
+    for (int note = start_note; note <= end_note; ++note) {
+        if (!isBlackKey(note)) {
+            float x = canvas_pos.x + white_key_idx * white_key_width;
+            
+            // Background stripe for white key lanes
+            ImU32 lane_color = (getNoteInOctave(note) == 0) ? 
+                IM_COL32(35, 35, 45, 255) : IM_COL32(28, 28, 36, 255);
+            draw_list->AddRectFilled(
+                ImVec2(x, canvas_pos.y),
+                ImVec2(x + white_key_width, canvas_pos.y + height),
+                lane_color
+            );
+            
+            // Lane separator
+            draw_list->AddLine(
+                ImVec2(x, canvas_pos.y),
+                ImVec2(x, canvas_pos.y + height),
+                IM_COL32(50, 50, 60, 255)
+            );
+            
+            white_key_idx++;
         }
     }
     
-    // Draw vertical grid lines (time markers)
+    // Draw horizontal grid lines (time markers)
     float time_grid = 0.5f;  // Every 0.5 seconds
     float grid_start = std::floor(time_start / time_grid) * time_grid;
     for (float t = grid_start; t <= current_time; t += time_grid) {
-        float x = canvas_pos.x + (t - time_start) * pixels_per_second;
-        if (x >= canvas_pos.x && x <= canvas_pos.x + width) {
-            draw_list->AddLine(ImVec2(x, canvas_pos.y), 
-                              ImVec2(x, canvas_pos.y + height), 
-                              IM_COL32(50, 50, 60, 255));
+        // Y position: bottom is current_time, top is time_start
+        float y = canvas_pos.y + height - (t - time_start) * pixels_per_second;
+        if (y >= canvas_pos.y && y <= canvas_pos.y + height) {
+            draw_list->AddLine(
+                ImVec2(canvas_pos.x, y),
+                ImVec2(canvas_pos.x + width, y),
+                IM_COL32(45, 45, 55, 255)
+            );
         }
     }
     
-    // Draw notes
+    // Helper function to get X position for a MIDI note
+    auto getNoteX = [&](int midi_note) -> std::pair<float, float> {
+        if (midi_note < start_note || midi_note > end_note) 
+            return {-1, -1};
+        
+        // Find position
+        int white_idx = 0;
+        for (int n = start_note; n < midi_note; ++n) {
+            if (!isBlackKey(n)) white_idx++;
+        }
+        
+        if (isBlackKey(midi_note)) {
+            // Black key - center on the gap between white keys
+            float x = canvas_pos.x + white_idx * white_key_width - black_key_width / 2;
+            return {x, black_key_width};
+        } else {
+            // White key
+            float x = canvas_pos.x + white_idx * white_key_width;
+            return {x, white_key_width - 1};
+        }
+    };
+    
+    // Draw notes (falling from top to bottom)
     for (const auto& note : piano_roll_notes_) {
         if (note.midi_note < start_note || note.midi_note > end_note) continue;
         
@@ -415,52 +459,67 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
         // Skip notes completely outside the visible range
         if (note_end_time < time_start || note.start_time > current_time) continue;
         
-        float x1 = canvas_pos.x + (note.start_time - time_start) * pixels_per_second;
-        float x2 = canvas_pos.x + (note_end_time - time_start) * pixels_per_second;
+        // Y positions (bottom = current time, notes fall down)
+        // note.start_time -> y2 (bottom of note, closer to current time)
+        // note_end_time -> y1 (top of note, further in past or still playing)
+        float y1 = canvas_pos.y + height - (note_end_time - time_start) * pixels_per_second;
+        float y2 = canvas_pos.y + height - (note.start_time - time_start) * pixels_per_second;
         
         // Clamp to visible area
-        x1 = std::max(x1, canvas_pos.x);
-        x2 = std::min(x2, canvas_pos.x + width);
+        y1 = std::max(y1, canvas_pos.y);
+        y2 = std::min(y2, canvas_pos.y + height);
         
-        if (x2 <= x1) continue;
+        if (y2 <= y1) continue;
         
-        float y = canvas_pos.y + (end_note - note.midi_note) * note_height;
+        // Get X position from note
+        auto [note_x, note_width] = getNoteX(note.midi_note);
+        if (note_x < 0) continue;
         
         ImU32 note_color = PianoChannelColors[note.channel];
         
+        // Add glow effect for active notes near the bottom
+        if (note.active && y2 >= canvas_pos.y + height - 20) {
+            ImU32 glow_color = note_color & 0x00FFFFFF;
+            glow_color |= 0x40000000;  // Semi-transparent
+            draw_list->AddRectFilled(
+                ImVec2(note_x - 2, y1 - 2),
+                ImVec2(note_x + note_width + 2, y2 + 2),
+                glow_color, 4.0f
+            );
+        }
+        
         // Draw note rectangle
         draw_list->AddRectFilled(
-            ImVec2(x1, y + 1),
-            ImVec2(x2, y + note_height - 1),
-            note_color, 2.0f
+            ImVec2(note_x + 1, y1),
+            ImVec2(note_x + note_width - 1, y2),
+            note_color, 3.0f
         );
         
-        // Draw note border
+        // Draw note border/highlight
         draw_list->AddRect(
-            ImVec2(x1, y + 1),
-            ImVec2(x2, y + note_height - 1),
-            IM_COL32(255, 255, 255, 100), 2.0f
+            ImVec2(note_x + 1, y1),
+            ImVec2(note_x + note_width - 1, y2),
+            IM_COL32(255, 255, 255, 80), 3.0f
         );
     }
     
-    // Draw playhead
-    float playhead_x = canvas_pos.x + width;
+    // Draw "hit line" at the bottom (where notes meet the keyboard)
     draw_list->AddLine(
-        ImVec2(playhead_x, canvas_pos.y),
-        ImVec2(playhead_x, canvas_pos.y + height),
-        IM_COL32(255, 255, 255, 200), 2.0f
+        ImVec2(canvas_pos.x, canvas_pos.y + height - 2),
+        ImVec2(canvas_pos.x + width, canvas_pos.y + height - 2),
+        IM_COL32(255, 255, 255, 150), 2.0f
     );
     
     // Border
     draw_list->AddRect(canvas_pos, 
                       ImVec2(canvas_pos.x + width, canvas_pos.y + height),
-                      IM_COL32(80, 80, 100, 255));
+                      IM_COL32(60, 60, 80, 255));
     
     ImGui::Dummy(ImVec2(width, height));
 }
 
 void PianoVisualizer::drawPianoWindow(bool* p_open, float current_time) {
-    ImGui::SetNextWindowSize(ImVec2(800, 400), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(900, 500), ImGuiCond_FirstUseEver);
     
     if (!ImGui::Begin("Piano Visualizer", p_open)) {
         ImGui::End();
@@ -468,35 +527,40 @@ void PianoVisualizer::drawPianoWindow(bool* p_open, float current_time) {
     }
     
     float available_width = ImGui::GetContentRegionAvail().x;
+    float available_height = ImGui::GetContentRegionAvail().y;
     
-    // Legend
+    // Top bar: Legend and settings
     ImGui::Text("Channels:");
     ImGui::SameLine();
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         ImVec4 color = ImGui::ColorConvertU32ToFloat4(PianoChannelColors[i]);
         ImGui::SameLine();
-        ImGui::ColorButton(PianoChannelNames[i], color, ImGuiColorEditFlags_NoTooltip, ImVec2(20, 14));
+        ImGui::ColorButton(PianoChannelNames[i], color, ImGuiColorEditFlags_NoTooltip, ImVec2(16, 14));
         ImGui::SameLine();
         ImGui::Text("%s", PianoChannelNames[i]);
     }
     
+    ImGui::SameLine(available_width - 350);
+    ImGui::SetNextItemWidth(100);
+    ImGui::SliderFloat("Speed", &piano_roll_seconds_, 1.0f, 8.0f, "%.1fs");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::SliderInt("Oct", &octave_low_, 1, 5);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    ImGui::SliderInt("to", &octave_high_, octave_low_ + 1, 7);
+    
     ImGui::Separator();
     
-    // Settings
-    ImGui::SliderFloat("Roll Speed (sec)", &piano_roll_seconds_, 1.0f, 10.0f);
-    ImGui::SliderInt("Octave Low", &octave_low_, 0, 6);
-    ImGui::SliderInt("Octave High", &octave_high_, octave_low_ + 1, 8);
+    // Calculate sizes for roll and keyboard
+    float keyboard_height = 90;
+    float roll_height = available_height - keyboard_height - 30;  // 30 for top bar
     
-    ImGui::Separator();
-    
-    // Piano roll (top section)
-    ImGui::Text("Piano Roll");
-    float roll_height = ImGui::GetContentRegionAvail().y - 100;
+    // Piano roll (notes falling down)
     drawPianoRoll("##roll", available_width, roll_height, current_time);
     
-    // Piano keyboard (bottom section)
-    ImGui::Text("Keyboard");
-    drawPianoKeyboard("##keyboard", available_width, 80);
+    // Piano keyboard (at the bottom, directly connected to roll)
+    drawPianoKeyboard("##keyboard", available_width, keyboard_height);
     
     ImGui::End();
 }
