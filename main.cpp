@@ -24,8 +24,12 @@
 // Audio Visualizer
 #include "AudioVisualizer.h"
 
+// Piano Visualizer
+#include "PianoVisualizer.h"
+
 static bool show_demo_window = false;
 static bool show_visualizer = true;
+static bool show_piano = true;
 
 // Mutex for protecting audio operations
 static std::mutex audio_mutex;
@@ -55,6 +59,12 @@ static struct {
     
     // Audio visualizer
     AudioVisualizer visualizer;
+    
+    // Piano visualizer
+    PianoVisualizer piano;
+    
+    // Playback time in seconds
+    std::atomic<float> playback_time{0.0f};
     
     // Audio buffer for visualization (double buffered)
     std::vector<short> viz_buffer;
@@ -91,6 +101,13 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     
     // Update visualizer with audio data
     state.visualizer.updateAudioData(temp_buffer.data(), num_samples);
+    
+    // Update playback time
+    float current_time = gme_tell(state.emu) / 1000.0f;
+    state.playback_time.store(current_time);
+    
+    // Update piano visualizer
+    state.piano.updateFromAudio(temp_buffer.data(), num_samples, state.sample_rate, current_time);
     
     // Convert 16-bit signed integer to 32-bit float (-1.0 to 1.0)
     // Apply volume control
@@ -146,6 +163,10 @@ void load_nsf_file(const char* path) {
     
     // Initialize visualizer with new emulator
     state.visualizer.init(state.emu, state.sample_rate);
+    
+    // Reset piano visualizer
+    state.piano.reset();
+    state.playback_time.store(0.0f);
     
     // Apply current settings
     gme_set_tempo(state.emu, state.tempo);
@@ -213,6 +234,8 @@ void draw_player_window() {
         }
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem("Audio Visualizer", nullptr, &show_visualizer);
+            ImGui::MenuItem("Piano Visualizer", nullptr, &show_piano);
+            ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window);
             ImGui::EndMenu();
         }
@@ -503,6 +526,12 @@ void frame(void) {
     // Visualizer window
     if (show_visualizer) {
         state.visualizer.drawVisualizerWindow(&show_visualizer);
+    }
+    
+    // Piano visualizer window
+    if (show_piano) {
+        float current_time = state.playback_time.load();
+        state.piano.drawPianoWindow(&show_piano, current_time);
     }
     
     // ImGui demo window
