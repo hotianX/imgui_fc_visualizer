@@ -6,6 +6,11 @@
 #include <deque>
 #include <mutex>
 #include <cmath>
+#include <functional>
+
+// Forward declarations
+struct Music_Emu;
+class Nes_Apu;
 
 // NES APU channel info for piano visualization
 struct NesNoteInfo {
@@ -15,14 +20,13 @@ struct NesNoteInfo {
     bool active;        // Is the note currently playing
 };
 
-// Piano roll note event
+// Piano roll note event (preprocessed)
 struct PianoRollNote {
     int channel;
     int midi_note;
     float velocity;
     float start_time;   // In seconds
-    float duration;     // In seconds, 0 if still playing
-    bool active;
+    float end_time;     // In seconds (when note ends)
 };
 
 // Channel colors for piano visualization
@@ -38,6 +42,9 @@ inline const char* PianoChannelNames[] = {
     "Sq1", "Sq2", "Tri", "Noi", "DMC"
 };
 
+// Callback type for getting APU data during preprocessing
+using ApuDataCallback = std::function<Nes_Apu*(Music_Emu*)>;
+
 class PianoVisualizer {
 public:
     PianoVisualizer();
@@ -46,24 +53,29 @@ public:
     // Reset state
     void reset();
 
-    // Update with detected frequencies from audio analysis
-    // frequencies: array of 5 frequencies (one per channel), 0 if silent
-    // amplitudes: array of 5 amplitudes (0.0 - 1.0)
-    void updateFromFrequencies(const float* frequencies, const float* amplitudes, float current_time);
+    // Preprocess a track to generate all note data ahead of time
+    // Returns true if successful, false if preprocessing failed
+    // progress_callback: optional callback for progress updates (0.0-1.0)
+    bool preprocessTrack(Music_Emu* emu, int track, long sample_rate,
+                        ApuDataCallback apu_callback,
+                        std::function<void(float)> progress_callback = nullptr);
+    
+    // Check if we have preprocessed data
+    bool hasPreprocessedData() const { return has_preprocessed_data_; }
+    
+    // Get preprocessed track duration
+    float getTrackDuration() const { return track_duration_; }
 
-    // Update with NES APU register data directly
-    // periods: array of 5 period values from APU oscillators
-    // lengths: array of 5 length counter values (0 = silent)
-    // amplitudes: array of 5 amplitude values
+    // Update current playback time (for live keyboard display)
+    void updatePlaybackTime(float current_time);
+    
+    // Update with NES APU register data for live keyboard highlighting
     void updateFromAPU(const int* periods, const int* lengths, const int* amplitudes, float current_time);
-
-    // Update with audio data for frequency detection (fallback)
-    void updateFromAudio(const short* samples, int sample_count, long sample_rate, float current_time);
 
     // Draw the piano keyboard
     void drawPianoKeyboard(const char* label, float width, float height);
 
-    // Draw the piano roll (scrolling notes)
+    // Draw the piano roll (scrolling notes - shows FUTURE notes falling down)
     void drawPianoRoll(const char* label, float width, float height, float current_time);
 
     // Draw complete piano visualizer window
@@ -80,43 +92,42 @@ private:
     static constexpr int MIDI_NOTE_MAX = 108;  // C8
     static constexpr float NES_CPU_CLOCK = 1789773.0f;  // NTSC
 
-    // Current note state per channel
+    // Current note state per channel (for live keyboard display)
     std::array<NesNoteInfo, NUM_CHANNELS> current_notes_;
     
-    // Piano roll history
-    std::deque<PianoRollNote> piano_roll_notes_;
-    static constexpr int MAX_ROLL_NOTES = 2000;
+    // Preprocessed note data (sorted by start_time)
+    std::vector<PianoRollNote> preprocessed_notes_;
+    bool has_preprocessed_data_ = false;
+    float track_duration_ = 0.0f;
     
-    // Previous state for note tracking
-    std::array<int, NUM_CHANNELS> prev_midi_notes_;
-    std::array<float, NUM_CHANNELS> note_start_times_;
+    // For preprocessing: track note state
+    std::array<int, NUM_CHANNELS> preprocess_prev_notes_;
+    std::array<float, NUM_CHANNELS> preprocess_note_start_;
+    std::array<float, NUM_CHANNELS> preprocess_note_velocity_;
     
     // Settings
-    float piano_roll_seconds_ = 4.0f;  // How many seconds of notes to show
+    float piano_roll_seconds_ = 3.0f;  // How many seconds of future notes to show
     int octave_low_ = 2;   // C2
     int octave_high_ = 7;  // C7
     
     // Thread safety
     std::mutex mutex_;
-
-    // FFT for frequency detection
-    static constexpr int FFT_SIZE = 4096;
-    std::vector<float> fft_buffer_;
     
     // Helper functions
     static int frequencyToMidi(float frequency);
     static float midiToFrequency(int midi_note);
     static bool isBlackKey(int midi_note);
-    static int getWhiteKeyIndex(int midi_note);  // Index among white keys
+    static int getWhiteKeyIndex(int midi_note);
     static int getOctave(int midi_note);
-    static int getNoteInOctave(int midi_note);   // 0-11
+    static int getNoteInOctave(int midi_note);
     
     void drawKey(ImDrawList* draw_list, ImVec2 pos, float width, float height, 
                  int midi_note, bool is_black, int pressed_channel, float velocity);
     
-    void processNoteChange(int channel, int new_midi_note, float velocity, float current_time);
+    // Process APU data during preprocessing
+    void processApuFrame(const int* periods, const int* lengths, const int* amplitudes, float current_time);
+    void finalizePreprocessing(float end_time);
     
-    // Detect dominant frequency from audio samples
-    float detectFrequency(const float* samples, int count, long sample_rate);
+    // Convert APU period to MIDI note
+    int periodToMidi(int channel, int period);
 };
-

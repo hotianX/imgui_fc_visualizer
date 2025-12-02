@@ -1,7 +1,8 @@
 #include "PianoVisualizer.h"
+#include "gme/gme.h"
+#include "gme/Nes_Apu.h"
 #include <algorithm>
 #include <cstring>
-#include <complex>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -9,7 +10,6 @@
 
 PianoVisualizer::PianoVisualizer() {
     reset();
-    fft_buffer_.resize(FFT_SIZE, 0.0f);
 }
 
 void PianoVisualizer::reset() {
@@ -17,16 +17,18 @@ void PianoVisualizer::reset() {
     
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         current_notes_[i] = {i, 0, 0.0f, false};
-        prev_midi_notes_[i] = -1;
-        note_start_times_[i] = 0.0f;
+        preprocess_prev_notes_[i] = -1;
+        preprocess_note_start_[i] = 0.0f;
+        preprocess_note_velocity_[i] = 0.0f;
     }
     
-    piano_roll_notes_.clear();
+    preprocessed_notes_.clear();
+    has_preprocessed_data_ = false;
+    track_duration_ = 0.0f;
 }
 
 int PianoVisualizer::frequencyToMidi(float frequency) {
     if (frequency <= 0) return -1;
-    // MIDI note = 69 + 12 * log2(freq / 440)
     float midi = 69.0f + 12.0f * std::log2(frequency / 440.0f);
     int note = static_cast<int>(std::round(midi));
     if (note < 0 || note > 127) return -1;
@@ -39,213 +41,270 @@ float PianoVisualizer::midiToFrequency(int midi_note) {
 
 bool PianoVisualizer::isBlackKey(int midi_note) {
     int note = midi_note % 12;
-    // C=0, C#=1, D=2, D#=3, E=4, F=5, F#=6, G=7, G#=8, A=9, A#=10, B=11
     return note == 1 || note == 3 || note == 6 || note == 8 || note == 10;
 }
 
 int PianoVisualizer::getWhiteKeyIndex(int midi_note) {
     int octave = midi_note / 12;
     int note = midi_note % 12;
-    // Count white keys before this note in the octave
     static const int white_key_offsets[] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
     return octave * 7 + white_key_offsets[note];
 }
 
 int PianoVisualizer::getOctave(int midi_note) {
-    return midi_note / 12 - 1;  // MIDI octave convention
+    return midi_note / 12 - 1;
 }
 
 int PianoVisualizer::getNoteInOctave(int midi_note) {
     return midi_note % 12;
 }
 
-void PianoVisualizer::processNoteChange(int channel, int new_midi_note, float velocity, float current_time) {
-    int prev_note = prev_midi_notes_[channel];
+int PianoVisualizer::periodToMidi(int channel, int period) {
+    if (period < 8) return -1;  // Too high frequency / silent
     
-    // End previous note if it was playing
-    if (prev_note >= 0 && prev_note != new_midi_note) {
-        // Find the active note and set its duration
-        for (auto& note : piano_roll_notes_) {
-            if (note.channel == channel && note.midi_note == prev_note && note.active) {
-                note.active = false;
-                note.duration = current_time - note.start_time;
-                break;
+    float freq = 0;
+    
+    if (channel == 3) {
+        // Noise channel - map to low notes
+        int noise_idx = period & 0x0F;
+        return 36 + (15 - noise_idx);  // C2 to C3 range
+    } else if (channel == 4) {
+        // DMC - fixed low note
+        return 28;  // E1
+    } else {
+        // Square1, Square2, Triangle
+        freq = NES_CPU_CLOCK / (16.0f * (period + 1));
+    }
+    
+    return frequencyToMidi(freq);
+}
+
+void PianoVisualizer::processApuFrame(const int* periods, const int* lengths, const int* amplitudes, float current_time) {
+    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+        int period = periods[ch];
+        int length = lengths[ch];
+        int amp = std::abs(amplitudes[ch]);
+        
+        int midi_note = -1;
+        float velocity = 0;
+        
+        if (ch == 3) {
+            // Noise
+            if (length > 0 && amp > 0) {
+                midi_note = 36 + (15 - (period & 0x0F));
+                velocity = std::min(1.0f, amp / 15.0f);
+            }
+        } else if (ch == 4) {
+            // DMC
+            if (length > 0 && amp > 0) {
+                midi_note = 28;
+                velocity = std::min(1.0f, amp / 127.0f);
+            }
+        } else {
+            // Square1, Square2, Triangle
+            if (length > 0 && amp > 0 && period >= 8) {
+                float freq = NES_CPU_CLOCK / (16.0f * (period + 1));
+                midi_note = frequencyToMidi(freq);
+                velocity = std::min(1.0f, amp / 15.0f);
+            }
+        }
+        
+        int prev_note = preprocess_prev_notes_[ch];
+        
+        // Note changed or ended
+        if (midi_note != prev_note || velocity < 0.01f) {
+            // End previous note
+            if (prev_note >= 0 && prev_note <= 127) {
+                PianoRollNote note;
+                note.channel = ch;
+                note.midi_note = prev_note;
+                note.velocity = preprocess_note_velocity_[ch];
+                note.start_time = preprocess_note_start_[ch];
+                note.end_time = current_time;
+                
+                // Only add if note has meaningful duration
+                if (note.end_time - note.start_time > 0.01f) {
+                    preprocessed_notes_.push_back(note);
+                }
+            }
+            
+            // Start new note
+            if (midi_note >= 0 && midi_note <= 127 && velocity > 0.01f) {
+                preprocess_prev_notes_[ch] = midi_note;
+                preprocess_note_start_[ch] = current_time;
+                preprocess_note_velocity_[ch] = velocity;
+            } else {
+                preprocess_prev_notes_[ch] = -1;
             }
         }
     }
+}
+
+void PianoVisualizer::finalizePreprocessing(float end_time) {
+    // End any notes still playing
+    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+        int prev_note = preprocess_prev_notes_[ch];
+        if (prev_note >= 0 && prev_note <= 127) {
+            PianoRollNote note;
+            note.channel = ch;
+            note.midi_note = prev_note;
+            note.velocity = preprocess_note_velocity_[ch];
+            note.start_time = preprocess_note_start_[ch];
+            note.end_time = end_time;
+            
+            if (note.end_time - note.start_time > 0.01f) {
+                preprocessed_notes_.push_back(note);
+            }
+        }
+        preprocess_prev_notes_[ch] = -1;
+    }
     
-    // Start new note
-    if (new_midi_note >= 0 && velocity > 0.05f && new_midi_note != prev_note) {
-        PianoRollNote new_note;
-        new_note.channel = channel;
-        new_note.midi_note = new_midi_note;
-        new_note.velocity = velocity;
-        new_note.start_time = current_time;
-        new_note.duration = 0;
-        new_note.active = true;
+    // Sort notes by start time
+    std::sort(preprocessed_notes_.begin(), preprocessed_notes_.end(),
+              [](const PianoRollNote& a, const PianoRollNote& b) {
+                  return a.start_time < b.start_time;
+              });
+    
+    track_duration_ = end_time;
+    has_preprocessed_data_ = true;
+}
+
+bool PianoVisualizer::preprocessTrack(Music_Emu* emu, int track, long sample_rate,
+                                       ApuDataCallback apu_callback,
+                                       std::function<void(float)> progress_callback) {
+    if (!emu || !apu_callback) return false;
+    
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Reset state
+    preprocessed_notes_.clear();
+    has_preprocessed_data_ = false;
+    track_duration_ = 0.0f;
+    
+    for (int i = 0; i < NUM_CHANNELS; ++i) {
+        preprocess_prev_notes_[i] = -1;
+        preprocess_note_start_[i] = 0.0f;
+        preprocess_note_velocity_[i] = 0.0f;
+    }
+    
+    // Get track info for duration estimate
+    track_info_t info;
+    if (gme_track_info(emu, &info, track) != nullptr) {
+        return false;
+    }
+    
+    // Estimate duration (use length if available, otherwise default to 3 minutes)
+    float estimated_duration = info.length > 0 ? info.length / 1000.0f : 180.0f;
+    // Cap at 5 minutes for preprocessing
+    estimated_duration = std::min(estimated_duration, 300.0f);
+    
+    // Start the track
+    if (gme_start_track(emu, track) != nullptr) {
+        return false;
+    }
+    
+    // Process audio in chunks to extract note data
+    const int chunk_samples = 1024;  // Stereo samples
+    std::vector<short> buffer(chunk_samples * 2);
+    
+    float current_time = 0;
+    float time_per_chunk = static_cast<float>(chunk_samples) / sample_rate;
+    int chunks_processed = 0;
+    int total_chunks = static_cast<int>(estimated_duration / time_per_chunk);
+    
+    while (current_time < estimated_duration && !gme_track_ended(emu)) {
+        // Generate audio (we need this to advance the emulator state)
+        gme_play(emu, chunk_samples * 2, buffer.data());
         
-        piano_roll_notes_.push_back(new_note);
-        note_start_times_[channel] = current_time;
+        // Get APU state
+        Nes_Apu* apu = apu_callback(emu);
+        if (apu) {
+            int periods[5], lengths[5], amplitudes[5];
+            for (int i = 0; i < 5; ++i) {
+                periods[i] = apu->osc_period(i);
+                lengths[i] = apu->osc_length(i);
+                amplitudes[i] = apu->osc_amplitude(i);
+            }
+            processApuFrame(periods, lengths, amplitudes, current_time);
+        }
         
-        // Limit the number of notes
-        while (piano_roll_notes_.size() > MAX_ROLL_NOTES) {
-            piano_roll_notes_.pop_front();
+        current_time += time_per_chunk;
+        chunks_processed++;
+        
+        // Progress callback
+        if (progress_callback && chunks_processed % 100 == 0) {
+            float progress = std::min(1.0f, current_time / estimated_duration);
+            progress_callback(progress);
         }
     }
     
-    prev_midi_notes_[channel] = (velocity > 0.05f) ? new_midi_note : -1;
+    // Finalize
+    finalizePreprocessing(current_time);
     
-    // Update current note state
-    current_notes_[channel].midi_note = new_midi_note;
-    current_notes_[channel].velocity = velocity;
-    current_notes_[channel].active = (new_midi_note >= 0 && velocity > 0.05f);
+    if (progress_callback) {
+        progress_callback(1.0f);
+    }
+    
+    return true;
 }
 
-void PianoVisualizer::updateFromFrequencies(const float* frequencies, const float* amplitudes, float current_time) {
+void PianoVisualizer::updatePlaybackTime(float current_time) {
     std::lock_guard<std::mutex> lock(mutex_);
     
+    // Update current notes based on preprocessed data
     for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
-        float freq = frequencies[ch];
-        float amp = amplitudes[ch];
-        
-        int midi_note = frequencyToMidi(freq);
-        processNoteChange(ch, midi_note, amp, current_time);
+        current_notes_[ch].active = false;
+    }
+    
+    // Find notes that are active at current_time
+    for (const auto& note : preprocessed_notes_) {
+        if (note.start_time <= current_time && note.end_time > current_time) {
+            int ch = note.channel;
+            if (ch >= 0 && ch < NUM_CHANNELS) {
+                current_notes_[ch].midi_note = note.midi_note;
+                current_notes_[ch].velocity = note.velocity;
+                current_notes_[ch].active = true;
+            }
+        }
     }
 }
 
 void PianoVisualizer::updateFromAPU(const int* periods, const int* lengths, const int* amplitudes, float current_time) {
     std::lock_guard<std::mutex> lock(mutex_);
     
+    // Update current notes for live keyboard display
     for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
         int period = periods[ch];
         int length = lengths[ch];
-        int amp = std::abs(amplitudes[ch]);  // Amplitude can be negative
+        int amp = std::abs(amplitudes[ch]);
         
-        // Calculate frequency from period
-        // NES APU frequency formula:
-        // Square/Triangle: freq = CPU_CLOCK / (16 * (period + 1))
-        float freq = 0;
         int midi_note = -1;
         float velocity = 0;
         
         if (ch == 3) {
-            // Noise channel - map to low notes as rhythm indicator
-            // Use a fixed low note range (C2-C3) based on noise "pitch" setting
-            int noise_idx = period & 0x0F;
             if (length > 0 && amp > 0) {
-                // Map noise period (0-15) to notes C2 (36) to C3 (48)
-                midi_note = 36 + (15 - noise_idx);  // Lower period = higher "pitch"
-                velocity = std::min(1.0f, static_cast<float>(amp) / 15.0f);
+                midi_note = 36 + (15 - (period & 0x0F));
+                velocity = std::min(1.0f, amp / 15.0f);
             }
         } else if (ch == 4) {
-            // DMC channel - show as a low bass note when active
             if (length > 0 && amp > 0) {
-                midi_note = 28;  // E1 - very low note for DMC
-                velocity = std::min(1.0f, static_cast<float>(amp) / 127.0f);
+                midi_note = 28;
+                velocity = std::min(1.0f, amp / 127.0f);
             }
         } else {
-            // Square1, Square2, Triangle
-            // Skip if channel is silent
-            if (length == 0 || amp == 0 || period < 8) {
-                // Note off (period < 8 produces ultrasonic frequencies)
-                processNoteChange(ch, -1, 0.0f, current_time);
-                continue;
+            if (length > 0 && amp > 0 && period >= 8) {
+                float freq = NES_CPU_CLOCK / (16.0f * (period + 1));
+                midi_note = frequencyToMidi(freq);
+                velocity = std::min(1.0f, amp / 15.0f);
             }
-            
-            freq = NES_CPU_CLOCK / (16.0f * (period + 1));
-            midi_note = frequencyToMidi(freq);
-            
-            // Normalize amplitude
-            // Square channels: 0-15, Triangle: 0-15 (but uses different scale)
-            float max_amp = (ch == 2) ? 15.0f : 15.0f;
-            velocity = std::min(1.0f, static_cast<float>(amp) / max_amp);
         }
         
-        // Only show notes within reasonable MIDI range
         if (midi_note >= 0 && midi_note <= 127 && velocity > 0.01f) {
-            processNoteChange(ch, midi_note, velocity, current_time);
+            current_notes_[ch].midi_note = midi_note;
+            current_notes_[ch].velocity = velocity;
+            current_notes_[ch].active = true;
         } else {
-            processNoteChange(ch, -1, 0.0f, current_time);
-        }
-    }
-}
-
-float PianoVisualizer::detectFrequency(const float* samples, int count, long sample_rate) {
-    if (count < 64) return 0;
-    
-    // Simple autocorrelation-based pitch detection
-    int max_lag = std::min(count / 2, static_cast<int>(sample_rate / 50));  // Min ~50 Hz
-    int min_lag = static_cast<int>(sample_rate / 2000);  // Max ~2000 Hz
-    
-    float best_correlation = 0;
-    int best_lag = 0;
-    
-    for (int lag = min_lag; lag < max_lag; ++lag) {
-        float correlation = 0;
-        float energy1 = 0;
-        float energy2 = 0;
-        
-        int compare_count = count - lag;
-        for (int i = 0; i < compare_count; ++i) {
-            correlation += samples[i] * samples[i + lag];
-            energy1 += samples[i] * samples[i];
-            energy2 += samples[i + lag] * samples[i + lag];
-        }
-        
-        if (energy1 > 0 && energy2 > 0) {
-            correlation /= std::sqrt(energy1 * energy2);
-            if (correlation > best_correlation) {
-                best_correlation = correlation;
-                best_lag = lag;
-            }
-        }
-    }
-    
-    if (best_correlation > 0.5f && best_lag > 0) {
-        return static_cast<float>(sample_rate) / best_lag;
-    }
-    
-    return 0;
-}
-
-void PianoVisualizer::updateFromAudio(const short* samples, int sample_count, long sample_rate, float current_time) {
-    if (!samples || sample_count < 128) return;
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    // Convert to float and mono
-    int mono_count = sample_count / 2;
-    std::vector<float> mono_samples(mono_count);
-    
-    for (int i = 0; i < mono_count; ++i) {
-        float left = samples[i * 2] / 32768.0f;
-        float right = samples[i * 2 + 1] / 32768.0f;
-        mono_samples[i] = (left + right) * 0.5f;
-    }
-    
-    // Calculate RMS for amplitude
-    float rms = 0;
-    for (float s : mono_samples) {
-        rms += s * s;
-    }
-    rms = std::sqrt(rms / mono_samples.size());
-    
-    // Detect dominant frequency
-    float freq = detectFrequency(mono_samples.data(), mono_count, sample_rate);
-    int midi_note = frequencyToMidi(freq);
-    
-    // For now, assign to triangle channel (most melodic)
-    // In a more sophisticated implementation, we'd analyze multiple frequency peaks
-    processNoteChange(2, midi_note, rms * 3.0f, current_time);  // Triangle
-    
-    // Simple estimation for other channels based on frequency bands
-    // This is a rough approximation
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
-        if (ch != 2) {  // Skip triangle, already processed
-            current_notes_[ch].velocity *= 0.9f;  // Decay
-            if (current_notes_[ch].velocity < 0.05f) {
-                current_notes_[ch].active = false;
-            }
+            current_notes_[ch].active = false;
         }
     }
 }
@@ -256,9 +315,7 @@ void PianoVisualizer::drawKey(ImDrawList* draw_list, ImVec2 pos, float width, fl
     ImU32 border_color = IM_COL32(40, 40, 40, 255);
     
     if (pressed_channel >= 0 && velocity > 0.05f) {
-        // Key is pressed - use channel color
         key_color = PianoChannelColors[pressed_channel];
-        // Modulate brightness by velocity
         int r = (key_color & 0xFF);
         int g = (key_color >> 8) & 0xFF;
         int b = (key_color >> 16) & 0xFF;
@@ -283,11 +340,9 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
     
-    // Calculate key dimensions
-    int start_note = octave_low_ * 12 + 12;  // C of start octave (add 12 for MIDI convention)
+    int start_note = octave_low_ * 12 + 12;
     int end_note = octave_high_ * 12 + 12;
     
-    // Count white keys
     int white_key_count = 0;
     for (int note = start_note; note <= end_note; ++note) {
         if (!isBlackKey(note)) white_key_count++;
@@ -298,7 +353,7 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
     float black_key_width = white_key_width * 0.65f;
     float black_key_height = height * 0.6f;
     
-    // Build map of which channel is pressing which note
+    // Build map of pressed keys
     std::array<int, 128> note_channel;
     std::array<float, 128> note_velocity;
     note_channel.fill(-1);
@@ -308,7 +363,6 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
         if (current_notes_[ch].active && current_notes_[ch].midi_note >= 0 && 
             current_notes_[ch].midi_note < 128) {
             int note = current_notes_[ch].midi_note;
-            // Higher priority to later channels or higher velocity
             if (note_channel[note] < 0 || current_notes_[ch].velocity > note_velocity[note]) {
                 note_channel[note] = ch;
                 note_velocity[note] = current_notes_[ch].velocity;
@@ -316,7 +370,7 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
         }
     }
     
-    // Draw white keys first
+    // Draw white keys
     int white_key_idx = 0;
     for (int note = start_note; note <= end_note; ++note) {
         if (!isBlackKey(note)) {
@@ -327,11 +381,10 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
         }
     }
     
-    // Draw black keys on top
+    // Draw black keys
     white_key_idx = 0;
     for (int note = start_note; note <= end_note; ++note) {
         if (!isBlackKey(note)) {
-            // Check if next note is black
             if (note + 1 <= end_note && isBlackKey(note + 1)) {
                 float black_x = canvas_pos.x + white_key_idx * white_key_width + 
                                white_key_width - black_key_width / 2;
@@ -346,7 +399,7 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
     // Draw octave labels
     white_key_idx = 0;
     for (int note = start_note; note <= end_note; ++note) {
-        if (!isBlackKey(note) && getNoteInOctave(note) == 0) {  // C note
+        if (!isBlackKey(note) && getNoteInOctave(note) == 0) {
             float label_x = canvas_pos.x + white_key_idx * white_key_width + 2;
             float label_y = canvas_pos.y + white_key_height - 14;
             char octave_label[8];
@@ -370,11 +423,10 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
                             ImVec2(canvas_pos.x + width, canvas_pos.y + height),
                             IM_COL32(20, 20, 28, 255));
     
-    // Calculate note range (same as keyboard)
     int start_note = octave_low_ * 12 + 12;
     int end_note = octave_high_ * 12 + 12;
     
-    // Count white keys for width calculation
+    // Count white keys
     int white_key_count = 0;
     for (int note = start_note; note <= end_note; ++note) {
         if (!isBlackKey(note)) white_key_count++;
@@ -383,17 +435,15 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
     float white_key_width = width / white_key_count;
     float black_key_width = white_key_width * 0.65f;
     
-    // Time flows vertically: top = future, bottom = current (keyboard position)
-    float time_start = current_time - piano_roll_seconds_;
+    // Time range: show FUTURE notes (current_time at bottom, future at top)
+    float time_end = current_time + piano_roll_seconds_;
     float pixels_per_second = height / piano_roll_seconds_;
     
-    // Draw vertical grid lines for each white key
+    // Draw lane backgrounds
     int white_key_idx = 0;
     for (int note = start_note; note <= end_note; ++note) {
         if (!isBlackKey(note)) {
             float x = canvas_pos.x + white_key_idx * white_key_width;
-            
-            // Background stripe for white key lanes
             ImU32 lane_color = (getNoteInOctave(note) == 0) ? 
                 IM_COL32(35, 35, 45, 255) : IM_COL32(28, 28, 36, 255);
             draw_list->AddRectFilled(
@@ -401,24 +451,22 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
                 ImVec2(x + white_key_width, canvas_pos.y + height),
                 lane_color
             );
-            
-            // Lane separator
             draw_list->AddLine(
                 ImVec2(x, canvas_pos.y),
                 ImVec2(x, canvas_pos.y + height),
                 IM_COL32(50, 50, 60, 255)
             );
-            
             white_key_idx++;
         }
     }
     
-    // Draw horizontal grid lines (time markers)
-    float time_grid = 0.5f;  // Every 0.5 seconds
-    float grid_start = std::floor(time_start / time_grid) * time_grid;
-    for (float t = grid_start; t <= current_time; t += time_grid) {
-        // Y position: bottom is current_time, top is time_start
-        float y = canvas_pos.y + height - (t - time_start) * pixels_per_second;
+    // Draw time grid lines
+    float time_grid = 0.5f;
+    float grid_start = std::floor(current_time / time_grid) * time_grid;
+    for (float t = grid_start; t <= time_end; t += time_grid) {
+        if (t < current_time) continue;
+        // Y: bottom = current_time, top = time_end
+        float y = canvas_pos.y + height - (t - current_time) * pixels_per_second;
         if (y >= canvas_pos.y && y <= canvas_pos.y + height) {
             draw_list->AddLine(
                 ImVec2(canvas_pos.x, y),
@@ -428,86 +476,81 @@ void PianoVisualizer::drawPianoRoll(const char* label, float width, float height
         }
     }
     
-    // Helper function to get X position for a MIDI note
+    // Helper to get X position for a note
     auto getNoteX = [&](int midi_note) -> std::pair<float, float> {
         if (midi_note < start_note || midi_note > end_note) 
             return {-1, -1};
         
-        // Find position
         int white_idx = 0;
         for (int n = start_note; n < midi_note; ++n) {
             if (!isBlackKey(n)) white_idx++;
         }
         
         if (isBlackKey(midi_note)) {
-            // Black key - center on the gap between white keys
             float x = canvas_pos.x + white_idx * white_key_width - black_key_width / 2;
             return {x, black_key_width};
         } else {
-            // White key
             float x = canvas_pos.x + white_idx * white_key_width;
             return {x, white_key_width - 1};
         }
     };
     
-    // Draw notes (falling from top to bottom)
-    for (const auto& note : piano_roll_notes_) {
-        if (note.midi_note < start_note || note.midi_note > end_note) continue;
-        
-        float note_end_time = note.active ? current_time : (note.start_time + note.duration);
-        
-        // Skip notes completely outside the visible range
-        if (note_end_time < time_start || note.start_time > current_time) continue;
-        
-        // Y positions (bottom = current time, notes fall down)
-        // note.start_time -> y2 (bottom of note, closer to current time)
-        // note_end_time -> y1 (top of note, further in past or still playing)
-        float y1 = canvas_pos.y + height - (note_end_time - time_start) * pixels_per_second;
-        float y2 = canvas_pos.y + height - (note.start_time - time_start) * pixels_per_second;
-        
-        // Clamp to visible area
-        y1 = std::max(y1, canvas_pos.y);
-        y2 = std::min(y2, canvas_pos.y + height);
-        
-        if (y2 <= y1) continue;
-        
-        // Get X position from note
-        auto [note_x, note_width] = getNoteX(note.midi_note);
-        if (note_x < 0) continue;
-        
-        ImU32 note_color = PianoChannelColors[note.channel];
-        
-        // Add glow effect for active notes near the bottom
-        if (note.active && y2 >= canvas_pos.y + height - 20) {
-            ImU32 glow_color = note_color & 0x00FFFFFF;
-            glow_color |= 0x40000000;  // Semi-transparent
+    // Draw notes from preprocessed data
+    if (has_preprocessed_data_) {
+        for (const auto& note : preprocessed_notes_) {
+            // Only show notes in the visible time window
+            if (note.end_time < current_time || note.start_time > time_end) continue;
+            if (note.midi_note < start_note || note.midi_note > end_note) continue;
+            
+            // Y positions: bottom = current_time, top = future
+            // note.start_time -> y2 (note starts, appears from top)
+            // note.end_time -> y1 (note ends, reaches bottom and disappears)
+            float y_start = canvas_pos.y + height - (note.start_time - current_time) * pixels_per_second;
+            float y_end = canvas_pos.y + height - (note.end_time - current_time) * pixels_per_second;
+            
+            // y1 is top (smaller Y, earlier/end), y2 is bottom (larger Y, later/start)
+            float y1 = std::max(y_end, canvas_pos.y);
+            float y2 = std::min(y_start, canvas_pos.y + height);
+            
+            if (y2 <= y1) continue;
+            
+            auto [note_x, note_width] = getNoteX(note.midi_note);
+            if (note_x < 0) continue;
+            
+            ImU32 note_color = PianoChannelColors[note.channel];
+            
+            // Glow effect for notes about to be played
+            bool about_to_play = (note.start_time <= current_time + 0.1f && note.start_time >= current_time);
+            if (about_to_play) {
+                ImU32 glow_color = note_color & 0x00FFFFFF;
+                glow_color |= 0x60000000;
+                draw_list->AddRectFilled(
+                    ImVec2(note_x - 3, y1 - 3),
+                    ImVec2(note_x + note_width + 3, y2 + 3),
+                    glow_color, 5.0f
+                );
+            }
+            
+            // Draw note
             draw_list->AddRectFilled(
-                ImVec2(note_x - 2, y1 - 2),
-                ImVec2(note_x + note_width + 2, y2 + 2),
-                glow_color, 4.0f
+                ImVec2(note_x + 1, y1),
+                ImVec2(note_x + note_width - 1, y2),
+                note_color, 3.0f
+            );
+            
+            draw_list->AddRect(
+                ImVec2(note_x + 1, y1),
+                ImVec2(note_x + note_width - 1, y2),
+                IM_COL32(255, 255, 255, 80), 3.0f
             );
         }
-        
-        // Draw note rectangle
-        draw_list->AddRectFilled(
-            ImVec2(note_x + 1, y1),
-            ImVec2(note_x + note_width - 1, y2),
-            note_color, 3.0f
-        );
-        
-        // Draw note border/highlight
-        draw_list->AddRect(
-            ImVec2(note_x + 1, y1),
-            ImVec2(note_x + note_width - 1, y2),
-            IM_COL32(255, 255, 255, 80), 3.0f
-        );
     }
     
-    // Draw "hit line" at the bottom (where notes meet the keyboard)
+    // Draw hit line at bottom
     draw_list->AddLine(
         ImVec2(canvas_pos.x, canvas_pos.y + height - 2),
         ImVec2(canvas_pos.x + width, canvas_pos.y + height - 2),
-        IM_COL32(255, 255, 255, 150), 2.0f
+        IM_COL32(255, 255, 255, 180), 3.0f
     );
     
     // Border
@@ -529,39 +572,47 @@ void PianoVisualizer::drawPianoWindow(bool* p_open, float current_time) {
     float available_width = ImGui::GetContentRegionAvail().x;
     float available_height = ImGui::GetContentRegionAvail().y;
     
-    // Top bar: Legend and settings
-    ImGui::Text("Channels:");
-    ImGui::SameLine();
+    // Status and legend
+    if (has_preprocessed_data_) {
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Ready");
+        ImGui::SameLine();
+        ImGui::Text("(%.1fs)", track_duration_);
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "No data - load a track to preprocess");
+    }
+    
+    ImGui::SameLine(150);
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         ImVec4 color = ImGui::ColorConvertU32ToFloat4(PianoChannelColors[i]);
-        ImGui::SameLine();
         ImGui::ColorButton(PianoChannelNames[i], color, ImGuiColorEditFlags_NoTooltip, ImVec2(16, 14));
         ImGui::SameLine();
         ImGui::Text("%s", PianoChannelNames[i]);
+        ImGui::SameLine();
     }
     
-    ImGui::SameLine(available_width - 350);
-    ImGui::SetNextItemWidth(100);
-    ImGui::SliderFloat("Speed", &piano_roll_seconds_, 1.0f, 8.0f, "%.1fs");
-    ImGui::SameLine();
+    ImGui::SameLine(available_width - 280);
     ImGui::SetNextItemWidth(80);
-    ImGui::SliderInt("Oct", &octave_low_, 1, 5);
+    ImGui::SliderFloat("Ahead", &piano_roll_seconds_, 1.0f, 6.0f, "%.1fs");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80);
-    ImGui::SliderInt("to", &octave_high_, octave_low_ + 1, 7);
+    ImGui::SetNextItemWidth(60);
+    ImGui::SliderInt("##oct1", &octave_low_, 1, 5);
+    ImGui::SameLine();
+    ImGui::Text("-");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(60);
+    ImGui::SliderInt("##oct2", &octave_high_, octave_low_ + 1, 7);
     
     ImGui::Separator();
     
-    // Calculate sizes for roll and keyboard
+    // Calculate sizes
     float keyboard_height = 90;
-    float roll_height = available_height - keyboard_height - 30;  // 30 for top bar
+    float roll_height = available_height - keyboard_height - 30;
     
-    // Piano roll (notes falling down)
+    // Piano roll (future notes falling down)
     drawPianoRoll("##roll", available_width, roll_height, current_time);
     
-    // Piano keyboard (at the bottom, directly connected to roll)
+    // Keyboard (at bottom)
     drawPianoKeyboard("##keyboard", available_width, keyboard_height);
     
     ImGui::End();
 }
-

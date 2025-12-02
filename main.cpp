@@ -68,6 +68,10 @@ static struct {
     // Playback time in seconds
     std::atomic<float> playback_time{0.0f};
     
+    // Piano preprocessing state
+    std::atomic<bool> preprocessing{false};
+    std::atomic<float> preprocess_progress{0.0f};
+    
     // Audio buffer for visualization (double buffered)
     std::vector<short> viz_buffer;
     int viz_buffer_pos = 0;
@@ -132,6 +136,52 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     }
 }
 
+// Helper to get APU from emulator
+Nes_Apu* getApuFromEmu(Music_Emu* emu) {
+    Nsf_Emu* nsf = dynamic_cast<Nsf_Emu*>(emu);
+    if (nsf) {
+        return nsf->apu_();
+    }
+    return nullptr;
+}
+
+// Preprocess current track for piano visualization
+void preprocess_piano_track() {
+    if (!state.emu || state.preprocessing.load()) return;
+    
+    state.preprocessing.store(true);
+    state.preprocess_progress.store(0.0f);
+    
+    // Create a separate emulator instance for preprocessing
+    Music_Emu* preprocess_emu = nullptr;
+    gme_err_t err = gme_open_file(state.loaded_file, &preprocess_emu, state.sample_rate);
+    
+    if (err || !preprocess_emu) {
+        state.preprocessing.store(false);
+        return;
+    }
+    
+    // Preprocess the track
+    state.piano.preprocessTrack(
+        preprocess_emu, 
+        state.current_track, 
+        state.sample_rate,
+        [](Music_Emu* emu) -> Nes_Apu* {
+            Nsf_Emu* nsf = dynamic_cast<Nsf_Emu*>(emu);
+            return nsf ? nsf->apu_() : nullptr;
+        },
+        [](float progress) {
+            state.preprocess_progress.store(progress);
+        }
+    );
+    
+    // Cleanup preprocessing emulator
+    gme_delete(preprocess_emu);
+    
+    state.preprocessing.store(false);
+    state.preprocess_progress.store(1.0f);
+}
+
 // Safe track start - can be called from UI thread
 void safe_start_track(int track) {
     if (!state.emu) return;
@@ -143,6 +193,17 @@ void safe_start_track(int track) {
     state.seek_request.store(-1);  // Clear any pending seek
     gme_start_track(state.emu, track);
     state.is_playing.store(true);  // Resume playback
+}
+
+// Start track and preprocess for piano
+void start_track_with_preprocess(int track) {
+    state.current_track = track;
+    
+    // Preprocess first (this will use a separate emulator)
+    preprocess_piano_track();
+    
+    // Then start playback
+    safe_start_track(track);
 }
 
 void load_nsf_file(const char* path) {
@@ -179,13 +240,18 @@ void load_nsf_file(const char* path) {
     // Initialize visualizer with new emulator
     state.visualizer.init(state.emu, state.sample_rate);
     
-    // Reset piano visualizer
+    // Reset piano visualizer and preprocess
     state.piano.reset();
     state.playback_time.store(0.0f);
     
     // Apply current settings
     gme_set_tempo(state.emu, state.tempo);
     gme_mute_voices(state.emu, state.visualizer.getMuteMask());
+}
+
+// Called after load to preprocess piano data (call without holding audio_mutex)
+void postload_preprocess() {
+    preprocess_piano_track();
 }
 
 void init(void) {
@@ -238,6 +304,7 @@ void draw_player_window() {
                 
                 if (result == NFD_OKAY) {
                     load_nsf_file(outPath);
+                    postload_preprocess();
                     NFD_FreePathU8(outPath);
                 }
             }
@@ -292,6 +359,7 @@ void draw_player_window() {
         
         if (result == NFD_OKAY) {
             load_nsf_file(outPath);
+            postload_preprocess();
             NFD_FreePathU8(outPath);
         }
     }
@@ -333,7 +401,7 @@ void draw_player_window() {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(200);
         if (ImGui::SliderInt("##track", &state.current_track, 0, state.track_count - 1, "Track %d")) {
-            safe_start_track(state.current_track);
+            start_track_with_preprocess(state.current_track);
         }
         ImGui::SameLine();
         ImGui::Text("/ %d", state.track_count);
@@ -411,7 +479,7 @@ void draw_player_window() {
                 // Auto-advance to next track
                 if (state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    safe_start_track(state.current_track);
+                    start_track_with_preprocess(state.current_track);
                 } else {
                     state.is_playing.store(false);
                 }
@@ -427,7 +495,7 @@ void draw_player_window() {
             if (ImGui::Button("|<", ImVec2(40, 30))) {
                 if (state.current_track > 0) {
                     state.current_track--;
-                    safe_start_track(state.current_track);
+                    start_track_with_preprocess(state.current_track);
                 }
             }
             ImGui::SameLine();
@@ -436,7 +504,7 @@ void draw_player_window() {
             const char* play_label = state.is_playing.load() ? "||" : ">";
             if (ImGui::Button(play_label, ImVec2(50, 30))) {
                 if (!state.is_playing.load()) {
-                    safe_start_track(state.current_track);
+                    safe_start_track(state.current_track);  // Same track, no re-preprocessing
                 } else {
                     state.is_playing.store(false);
                 }
@@ -455,7 +523,7 @@ void draw_player_window() {
             if (ImGui::Button(">|", ImVec2(40, 30))) {
                 if (state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    safe_start_track(state.current_track);
+                    start_track_with_preprocess(state.current_track);
                 }
             }
         }
@@ -599,7 +667,7 @@ void input(const sapp_event* ev) {
                 // Toggle play/pause
                 if (state.emu) {
                     if (!state.is_playing.load()) {
-                        safe_start_track(state.current_track);
+                        safe_start_track(state.current_track);  // Same track, no re-preprocessing
                     } else {
                         state.is_playing.store(false);
                     }
@@ -610,7 +678,7 @@ void input(const sapp_event* ev) {
                 // Previous track
                 if (state.emu && state.current_track > 0) {
                     state.current_track--;
-                    safe_start_track(state.current_track);
+                    start_track_with_preprocess(state.current_track);
                 }
                 break;
                 
@@ -618,7 +686,7 @@ void input(const sapp_event* ev) {
                 // Next track
                 if (state.emu && state.current_track < state.track_count - 1) {
                     state.current_track++;
-                    safe_start_track(state.current_track);
+                    start_track_with_preprocess(state.current_track);
                 }
                 break;
                 
@@ -639,6 +707,7 @@ void input(const sapp_event* ev) {
             
             if (result == NFD_OKAY) {
                 load_nsf_file(outPath);
+                postload_preprocess();
                 NFD_FreePathU8(outPath);
             }
         }
