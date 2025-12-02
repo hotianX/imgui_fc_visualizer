@@ -162,24 +162,10 @@ void init(void) {
     simgui_desc.logger.func = slog_func;
     simgui_setup(&simgui_desc);
 
-    // Dark theme with NES-inspired colors
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 4.0f;
-    style.FrameRounding = 2.0f;
-    style.ScrollbarRounding = 2.0f;
-    
-    ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.12f, 0.95f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.12f, 0.10f, 0.18f, 1.0f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.20f, 0.15f, 0.30f, 1.0f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.15f, 0.22f, 1.0f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.25f, 0.35f, 1.0f);
-    colors[ImGuiCol_Button] = ImVec4(0.30f, 0.25f, 0.45f, 1.0f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.45f, 0.35f, 0.60f, 1.0f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.50f, 0.40f, 0.70f, 1.0f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.70f, 0.50f, 0.90f, 1.0f);
+    // Use ImGui default dark theme (blue style)
+    ImGui::StyleColorsDark();
 
-    state.pass_action.colors[0] = { .load_action=SG_LOADACTION_CLEAR, .clear_value={0.05f, 0.05f, 0.08f, 1.0f } };
+    state.pass_action.colors[0] = { .load_action=SG_LOADACTION_CLEAR, .clear_value={0.1f, 0.1f, 0.1f, 1.0f } };
     
     // Initialize sokol_audio with callback model
     saudio_desc audio_desc = {};
