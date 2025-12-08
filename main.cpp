@@ -1,4 +1,3 @@
-#define SOKOL_IMPL
 #define SOKOL_GLCORE
 #include "sokol_app.h"
 #include "sokol_gfx.h"
@@ -11,7 +10,6 @@
 #include <mutex>
 #include <atomic>
 
-#define SOKOL_IMGUI_IMPL
 #include "imgui.h"
 #include "util/sokol_imgui.h"
 
@@ -29,9 +27,23 @@
 // Piano Visualizer
 #include "PianoVisualizer.h"
 
+// NES Emulator
+#include "NesEmulator.h"
+
 static bool show_demo_window = false;
 static bool show_visualizer = true;
 static bool show_piano = true;
+static bool show_emulator = false;
+
+// Application mode: NSF Player or NES Emulator
+enum class AppMode {
+    NSF_PLAYER,
+    NES_EMULATOR
+};
+static AppMode current_mode = AppMode::NSF_PLAYER;
+
+// Keyboard state tracking for NES input
+static bool key_states[512] = {};  // Track key press states
 
 // Mutex for protecting audio operations
 static std::mutex audio_mutex;
@@ -75,13 +87,52 @@ static struct {
     // Audio buffer for visualization (double buffered)
     std::vector<short> viz_buffer;
     int viz_buffer_pos = 0;
+    
+    // NES Emulator
+    NesEmulator nes_emu;
+    bool nes_rom_loaded = false;
+    agnes_input_t nes_input = {};  // Current controller input
+    float nes_screen_scale = 2.0f;
 } state;
 
 // Audio stream callback - called from audio thread
 void audio_stream_callback(float* buffer, int num_frames, int num_channels, void* user_data) {
+    const int num_samples = num_frames * num_channels;
+    
+    // Handle NES Emulator mode
+    if (current_mode == AppMode::NES_EMULATOR && state.nes_emu.isRunning()) {
+        static std::vector<short> nes_temp_buffer;
+        nes_temp_buffer.resize(num_samples);
+        
+        // Read audio samples from emulator
+        int samples_read = state.nes_emu.readAudioSamples(nes_temp_buffer.data(), num_samples);
+        
+        // If we got fewer samples than needed, fill the rest with silence
+        for (int i = samples_read; i < num_samples; ++i) {
+            nes_temp_buffer[i] = 0;
+        }
+        
+        // Update visualizer with audio data
+        state.visualizer.updateAudioData(nes_temp_buffer.data(), num_samples);
+        
+        // Update piano visualizer with APU data
+        int periods[5], lengths[5], amplitudes[5];
+        state.nes_emu.getApuState(periods, lengths, amplitudes);
+        float current_time = static_cast<float>(state.nes_emu.getCpuCycles()) / 1789773.0f;
+        state.piano.updateFromAPU(periods, lengths, amplitudes, current_time);
+        
+        // Convert to float
+        float volume_linear = std::pow(10.0f, state.volume_db / 20.0f);
+        for (int i = 0; i < num_samples; ++i) {
+            buffer[i] = (nes_temp_buffer[i] / 32768.0f) * volume_linear;
+        }
+        return;
+    }
+    
+    // Handle NSF Player mode
     if (!state.emu || !state.is_playing.load()) {
         // Fill with silence
-        std::fill(buffer, buffer + num_frames * num_channels, 0.0f);
+        std::fill(buffer, buffer + num_samples, 0.0f);
         return;
     }
     
@@ -94,7 +145,6 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     }
     
     // Game_Music_Emu generates 16-bit signed samples (stereo)
-    const int num_samples = num_frames * num_channels;
     static std::vector<short> temp_buffer;
     temp_buffer.resize(num_samples);
     
@@ -254,6 +304,151 @@ void postload_preprocess() {
     preprocess_piano_track();
 }
 
+// Load NES ROM file
+void load_nes_rom(const char* path) {
+    if (state.nes_emu.loadROM(path)) {
+        state.nes_rom_loaded = true;
+        current_mode = AppMode::NES_EMULATOR;
+        show_emulator = true;
+        
+        // Reset visualizers for emulator mode
+        state.visualizer.reset();
+        state.piano.reset();
+    } else {
+        strncpy(state.error_msg, "Failed to load NES ROM", sizeof(state.error_msg) - 1);
+    }
+}
+
+// Draw NES Emulator window
+void draw_emulator_window(bool* p_open) {
+    ImGui::SetNextWindowSize(ImVec2(540, 540), ImGuiCond_FirstUseEver);
+    
+    if (ImGui::Begin("NES Emulator", p_open, ImGuiWindowFlags_MenuBar)) {
+        // Menu bar
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open ROM...", "Ctrl+R")) {
+                    nfdu8filteritem_t filterItem[2];
+                    filterItem[0].name = "NES ROM Files";
+                    filterItem[0].spec = "nes";
+                    filterItem[1].name = "All Files";
+                    filterItem[1].spec = "*";
+                    
+                    nfdu8char_t* outPath = nullptr;
+                    nfdresult_t result = NFD_OpenDialogU8(&outPath, filterItem, 2, nullptr);
+                    
+                    if (result == NFD_OKAY) {
+                        load_nes_rom(outPath);
+                        NFD_FreePathU8(outPath);
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Close ROM")) {
+                    state.nes_emu.pause();
+                    state.nes_rom_loaded = false;
+                    current_mode = AppMode::NSF_PLAYER;
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Emulation")) {
+                bool running = state.nes_emu.isRunning();
+                if (ImGui::MenuItem(running ? "Pause" : "Resume", "P")) {
+                    if (running) state.nes_emu.pause();
+                    else state.nes_emu.resume();
+                }
+                if (ImGui::MenuItem("Reset", "F5")) {
+                    state.nes_emu.reset();
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                ImGui::SliderFloat("Scale", &state.nes_screen_scale, 1.0f, 4.0f, "%.1fx");
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenuBar();
+        }
+        
+        if (state.nes_rom_loaded) {
+            // Emulation controls
+            ImGui::BeginGroup();
+            {
+                bool running = state.nes_emu.isRunning();
+                
+                if (ImGui::Button(running ? "Pause" : "Play", ImVec2(60, 25))) {
+                    if (running) state.nes_emu.pause();
+                    else state.nes_emu.resume();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset", ImVec2(60, 25))) {
+                    state.nes_emu.reset();
+                }
+                ImGui::SameLine();
+                
+                // Status
+                if (running) {
+                    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f), "Running");
+                } else {
+                    ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.3f, 1.0f), "Paused");
+                }
+            }
+            ImGui::EndGroup();
+            
+            ImGui::Separator();
+            
+            // Display the NES screen
+            // Center the screen in the available space
+            ImVec2 content_size = ImGui::GetContentRegionAvail();
+            float screen_width = AGNES_SCREEN_WIDTH * state.nes_screen_scale;
+            float screen_height = AGNES_SCREEN_HEIGHT * state.nes_screen_scale;
+            
+            float offset_x = (content_size.x - screen_width) * 0.5f;
+            if (offset_x > 0) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset_x);
+            }
+            
+            // Draw the emulator screen
+            state.nes_emu.drawScreen(state.nes_screen_scale);
+            
+            ImGui::Separator();
+            
+            // Controller info
+            ImGui::Text("Controls: Arrow Keys = D-Pad, Z = A, X = B, Enter = Start, Shift = Select");
+        } else {
+            // No ROM loaded
+            ImVec2 content_size = ImGui::GetContentRegionAvail();
+            ImVec2 text_size = ImGui::CalcTextSize("Load a NES ROM to start");
+            ImGui::SetCursorPos(ImVec2(
+                (content_size.x - text_size.x) * 0.5f,
+                (content_size.y - text_size.y) * 0.5f
+            ));
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.6f, 1.0f), "Load a NES ROM to start");
+        }
+    }
+    ImGui::End();
+}
+
+// Update NES controller input from keyboard
+void update_nes_input() {
+    // Reset input
+    memset(&state.nes_input, 0, sizeof(state.nes_input));
+    
+    // D-Pad
+    state.nes_input.up = key_states[SAPP_KEYCODE_UP];
+    state.nes_input.down = key_states[SAPP_KEYCODE_DOWN];
+    state.nes_input.left = key_states[SAPP_KEYCODE_LEFT];
+    state.nes_input.right = key_states[SAPP_KEYCODE_RIGHT];
+    
+    // Buttons
+    state.nes_input.a = key_states[SAPP_KEYCODE_Z];
+    state.nes_input.b = key_states[SAPP_KEYCODE_X];
+    state.nes_input.start = key_states[SAPP_KEYCODE_ENTER];
+    state.nes_input.select = key_states[SAPP_KEYCODE_RIGHT_SHIFT] || 
+                             key_states[SAPP_KEYCODE_LEFT_SHIFT];
+    
+    // Set input to emulator
+    state.nes_emu.setInput(0, state.nes_input);
+}
+
 void init(void) {
     sg_desc _sg_desc{};
     _sg_desc.environment = sglue_environment();
@@ -283,6 +478,9 @@ void init(void) {
     
     // Initialize Native File Dialog
     NFD_Init();
+    
+    // Initialize NES Emulator
+    state.nes_emu.init(state.sample_rate);
 }
 
 void draw_player_window() {
@@ -312,6 +510,25 @@ void draw_player_window() {
             if (ImGui::MenuItem("Exit")) {
                 sapp_request_quit();
             }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Emulator")) {
+            if (ImGui::MenuItem("Open NES ROM...", "Ctrl+R")) {
+                nfdu8filteritem_t filterItem[2];
+                filterItem[0].name = "NES ROM Files";
+                filterItem[0].spec = "nes";
+                filterItem[1].name = "All Files";
+                filterItem[1].spec = "*";
+                
+                nfdu8char_t* outPath = nullptr;
+                nfdresult_t result = NFD_OpenDialogU8(&outPath, filterItem, 2, nullptr);
+                
+                if (result == NFD_OKAY) {
+                    load_nes_rom(outPath);
+                    NFD_FreePathU8(outPath);
+                }
+            }
+            ImGui::MenuItem("Show Emulator Window", nullptr, &show_emulator);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
@@ -603,8 +820,24 @@ void frame(void) {
     const int height = sapp_height();
     simgui_new_frame({ width, height, sapp_frame_duration(), sapp_dpi_scale() });
 
+    // Run NES emulator frame if active
+    if (current_mode == AppMode::NES_EMULATOR && state.nes_emu.isRunning()) {
+        // Update input from keyboard (only if ImGui doesn't want keyboard)
+        if (!ImGui::GetIO().WantCaptureKeyboard) {
+            update_nes_input();
+        }
+        
+        // Run one frame of emulation
+        state.nes_emu.runFrame();
+    }
+
     // Main player window
     draw_player_window();
+    
+    // NES Emulator window
+    if (show_emulator) {
+        draw_emulator_window(&show_emulator);
+    }
     
     // Visualizer window
     if (show_visualizer) {
@@ -613,7 +846,9 @@ void frame(void) {
     
     // Piano visualizer window
     if (show_piano) {
-        float current_time = state.playback_time.load();
+        float current_time = (current_mode == AppMode::NES_EMULATOR) 
+            ? static_cast<float>(state.nes_emu.getCpuCycles()) / 1789773.0f
+            : state.playback_time.load();
         state.piano.drawPianoWindow(&show_piano, current_time);
     }
     
@@ -660,6 +895,13 @@ void cleanup(void) {
 void input(const sapp_event* ev) {
     simgui_handle_event(ev);
     
+    // Track key states for NES controller input
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+        if (ev->key_code < 512) key_states[ev->key_code] = true;
+    } else if (ev->type == SAPP_EVENTTYPE_KEY_UP) {
+        if (ev->key_code < 512) key_states[ev->key_code] = false;
+    }
+    
     // Keyboard shortcuts
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
         switch (ev->key_code) {
@@ -694,7 +936,7 @@ void input(const sapp_event* ev) {
                 break;
         }
         
-        // Ctrl+O: Open file
+        // Ctrl+O: Open NSF file
         if (ev->key_code == SAPP_KEYCODE_O && (ev->modifiers & SAPP_MODIFIER_CTRL)) {
             nfdu8filteritem_t filterItem[2];
             filterItem[0].name = "NES Sound Files";
@@ -710,6 +952,37 @@ void input(const sapp_event* ev) {
                 postload_preprocess();
                 NFD_FreePathU8(outPath);
             }
+        }
+        
+        // Ctrl+R: Open NES ROM
+        if (ev->key_code == SAPP_KEYCODE_R && (ev->modifiers & SAPP_MODIFIER_CTRL)) {
+            nfdu8filteritem_t filterItem[2];
+            filterItem[0].name = "NES ROM Files";
+            filterItem[0].spec = "nes";
+            filterItem[1].name = "All Files";
+            filterItem[1].spec = "*";
+            
+            nfdu8char_t* outPath = nullptr;
+            nfdresult_t result = NFD_OpenDialogU8(&outPath, filterItem, 2, nullptr);
+            
+            if (result == NFD_OKAY) {
+                load_nes_rom(outPath);
+                NFD_FreePathU8(outPath);
+            }
+        }
+        
+        // P: Toggle emulator pause (when in emulator mode)
+        if (ev->key_code == SAPP_KEYCODE_P && current_mode == AppMode::NES_EMULATOR) {
+            if (state.nes_emu.isRunning()) {
+                state.nes_emu.pause();
+            } else {
+                state.nes_emu.resume();
+            }
+        }
+        
+        // F5: Reset emulator
+        if (ev->key_code == SAPP_KEYCODE_F5 && current_mode == AppMode::NES_EMULATOR) {
+            state.nes_emu.reset();
         }
     }
 }

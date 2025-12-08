@@ -67,5 +67,11 @@ add_library(game_music_emu STATIC
     Game_Music_Emu/gme/Sms_Apu.cpp)
 target_include_directories(game_music_emu PUBLIC Game_Music_Emu)
 
+# agnes - NES emulator core (CPU/PPU/Mappers)
+add_library(agnes STATIC
+    agnes/agnes.c
+)
+target_include_directories(agnes PUBLIC agnes)
+
 # nfd
 add_subdirectory(nativefiledialog-extended)
