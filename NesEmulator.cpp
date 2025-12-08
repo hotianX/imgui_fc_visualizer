@@ -52,10 +52,10 @@ bool NesEmulator::init(long audio_sample_rate) {
 }
 
 void NesEmulator::initApu() {
-    // Set up Blip_Buffer with larger capacity to prevent buffer underruns
+    // Set up Blip_Buffer
     // At 44100Hz, each frame generates ~735 samples
-    // Use 500ms buffer (about 30 frames worth) for smooth audio
-    apu_buffer_.set_sample_rate(sample_rate_, 500);  // 500ms buffer length
+    // Use 200ms buffer (~12 frames worth) for smooth audio with low latency
+    apu_buffer_.set_sample_rate(sample_rate_, 200);
     apu_buffer_.clock_rate(static_cast<long>(CPU_CLOCK_NTSC));
     
     // Set up APU
@@ -133,12 +133,19 @@ void NesEmulator::reset() {
 void NesEmulator::runFrame() {
     if (!agnes_ || !rom_loaded_ || !running_) return;
     
-    // Only update screen texture if a new frame is ready
-    // The actual emulation is driven by the audio callback
-    if (frame_ready_.exchange(false)) {
-        // Update screen texture (must be called from main thread)
-        updateScreenTexture();
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Set input
+    agnes_set_input(agnes_, &input_[0], &input_[1]);
+    
+    // Run one frame of emulation
+    agnes_next_frame(agnes_);
+    
+    // End APU frame to generate audio samples
+    endApuFrame();
+    
+    // Update screen texture
+    updateScreenTexture();
 }
 
 void NesEmulator::setInput(int player, const agnes_input_t& input) {
@@ -203,47 +210,10 @@ long NesEmulator::samplesAvailable() const {
     return apu_buffer_.samples_avail();
 }
 
-void NesEmulator::generateAudioSamples(int samples_needed) {
-    if (!agnes_ || !rom_loaded_ || !running_) return;
-    
-    // Run frames until we have enough audio samples
-    // NES generates about 44100/60 ≈ 735 samples per frame at 44100Hz
-    while (apu_buffer_.samples_avail() < samples_needed) {
-        // Set input
-        agnes_set_input(agnes_, &input_[0], &input_[1]);
-        
-        // Run one frame
-        agnes_next_frame(agnes_);
-        
-        // End APU frame to generate audio samples
-        uint64_t current_cycle = agnes_get_cpu_cycles(agnes_);
-        nes_time_t frame_length = static_cast<nes_time_t>(current_cycle - last_apu_cycle_);
-        
-        apu_.end_frame(frame_length);
-        apu_buffer_.end_frame(frame_length);
-        
-        last_apu_cycle_ = current_cycle;
-        
-        // Copy screen buffer while we have the lock (for thread safety)
-        for (int y = 0; y < AGNES_SCREEN_HEIGHT; ++y) {
-            for (int x = 0; x < AGNES_SCREEN_WIDTH; ++x) {
-                agnes_color_t color = agnes_get_screen_pixel(agnes_, x, y);
-                screen_pixels_[y * AGNES_SCREEN_WIDTH + x] = 
-                    (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
-            }
-        }
-        
-        // Signal that a new frame is ready for display
-        frame_ready_.store(true);
-    }
-}
-
 int NesEmulator::readAudioSamples(short* buffer, int max_samples) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Generate enough samples if needed (audio-driven emulation)
-    generateAudioSamples(max_samples);
-    
+    // Just read from buffer - emulation is driven by main thread
     long available = apu_buffer_.samples_avail();
     if (available <= 0) return 0;
     
@@ -301,10 +271,18 @@ void NesEmulator::destroyScreenTexture() {
 }
 
 void NesEmulator::updateScreenTexture() {
-    if (!texture_created_) return;
+    if (!agnes_ || !texture_created_) return;
     
-    // screen_pixels_ is already filled by generateAudioSamples()
-    // Just upload to GPU texture
+    // Convert agnes screen buffer to RGBA pixels
+    for (int y = 0; y < AGNES_SCREEN_HEIGHT; ++y) {
+        for (int x = 0; x < AGNES_SCREEN_WIDTH; ++x) {
+            agnes_color_t color = agnes_get_screen_pixel(agnes_, x, y);
+            screen_pixels_[y * AGNES_SCREEN_WIDTH + x] = 
+                (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
+        }
+    }
+    
+    // Upload to GPU texture
     sg_image_data data = {};
     data.mip_levels[0].ptr = screen_pixels_;
     data.mip_levels[0].size = sizeof(screen_pixels_);

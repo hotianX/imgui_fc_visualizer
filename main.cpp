@@ -474,11 +474,10 @@ void init(void) {
     state.pass_action.colors[0] = { .load_action=SG_LOADACTION_CLEAR, .clear_value={0.1f, 0.1f, 0.1f, 1.0f } };
     
     // Initialize sokol_audio with callback model
-    // Use larger buffer to reduce audio crackling
     saudio_desc audio_desc = {};
     audio_desc.sample_rate = state.sample_rate;
     audio_desc.num_channels = 2; // Stereo
-    audio_desc.buffer_frames = 4096;  // Increased from 2048 for smoother audio
+    audio_desc.buffer_frames = 2048;  // ~46ms latency
     audio_desc.stream_userdata_cb = audio_stream_callback;
     audio_desc.user_data = nullptr;
     audio_desc.logger.func = slog_func;
