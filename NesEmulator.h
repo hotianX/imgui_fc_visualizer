@@ -35,11 +35,17 @@ public:
     // Input
     void setInput(int player, const agnes_input_t& input);
     
-    // Audio - get samples for audio output
+    // Audio - get samples for audio output (runs emulation as needed)
     int readAudioSamples(short* buffer, int max_samples);
+    
+    // Generate audio samples by running emulation (called from audio thread)
+    void generateAudioSamples(int samples_needed);
     
     // Get APU data for visualization
     void getApuState(int* periods, int* lengths, int* amplitudes);
+    
+    // Get samples available in buffer
+    long samplesAvailable() const;
     
     // Video - get screen texture for rendering
     sg_image getScreenTexture() const { return screen_texture_; }
@@ -82,6 +88,7 @@ private:
     bool rom_loaded_ = false;
     std::string rom_path_;
     std::vector<uint8_t> rom_data_;
+    std::atomic<bool> frame_ready_{false};  // Flag to indicate a new frame is ready for display
     
     // Input
     agnes_input_t input_[2] = {};

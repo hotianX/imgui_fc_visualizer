@@ -102,18 +102,26 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     // Handle NES Emulator mode
     if (current_mode == AppMode::NES_EMULATOR && state.nes_emu.isRunning()) {
         static std::vector<short> nes_temp_buffer;
-        nes_temp_buffer.resize(num_samples);
         
-        // Read audio samples from emulator
-        int samples_read = state.nes_emu.readAudioSamples(nes_temp_buffer.data(), num_samples);
+        // NES APU outputs mono, we need num_frames mono samples
+        nes_temp_buffer.resize(num_frames);
+        
+        // Read audio samples from emulator (mono)
+        int samples_read = state.nes_emu.readAudioSamples(nes_temp_buffer.data(), num_frames);
         
         // If we got fewer samples than needed, fill the rest with silence
-        for (int i = samples_read; i < num_samples; ++i) {
+        for (int i = samples_read; i < num_frames; ++i) {
             nes_temp_buffer[i] = 0;
         }
         
-        // Update visualizer with audio data
-        state.visualizer.updateAudioData(nes_temp_buffer.data(), num_samples);
+        // Update visualizer with audio data (convert mono to stereo for visualizer)
+        static std::vector<short> stereo_buffer;
+        stereo_buffer.resize(num_samples);
+        for (int i = 0; i < num_frames; ++i) {
+            stereo_buffer[i * 2] = nes_temp_buffer[i];
+            stereo_buffer[i * 2 + 1] = nes_temp_buffer[i];
+        }
+        state.visualizer.updateAudioData(stereo_buffer.data(), num_samples);
         
         // Update piano visualizer with APU data
         int periods[5], lengths[5], amplitudes[5];
@@ -121,10 +129,12 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
         float current_time = static_cast<float>(state.nes_emu.getCpuCycles()) / 1789773.0f;
         state.piano.updateFromAPU(periods, lengths, amplitudes, current_time);
         
-        // Convert to float
+        // Convert mono to stereo float output
         float volume_linear = std::pow(10.0f, state.volume_db / 20.0f);
-        for (int i = 0; i < num_samples; ++i) {
-            buffer[i] = (nes_temp_buffer[i] / 32768.0f) * volume_linear;
+        for (int i = 0; i < num_frames; ++i) {
+            float sample = (nes_temp_buffer[i] / 32768.0f) * volume_linear;
+            buffer[i * 2] = sample;      // Left channel
+            buffer[i * 2 + 1] = sample;  // Right channel
         }
         return;
     }
@@ -464,10 +474,11 @@ void init(void) {
     state.pass_action.colors[0] = { .load_action=SG_LOADACTION_CLEAR, .clear_value={0.1f, 0.1f, 0.1f, 1.0f } };
     
     // Initialize sokol_audio with callback model
+    // Use larger buffer to reduce audio crackling
     saudio_desc audio_desc = {};
     audio_desc.sample_rate = state.sample_rate;
     audio_desc.num_channels = 2; // Stereo
-    audio_desc.buffer_frames = 2048;
+    audio_desc.buffer_frames = 4096;  // Increased from 2048 for smoother audio
     audio_desc.stream_userdata_cb = audio_stream_callback;
     audio_desc.user_data = nullptr;
     audio_desc.logger.func = slog_func;
