@@ -59,6 +59,9 @@ public:
 
     // Update audio data (called in audio callback)
     void updateAudioData(const short* samples, int sample_count);
+    
+    // Update channel amplitudes from APU (for accurate per-channel levels)
+    void updateChannelAmplitudesFromAPU(const int* amplitudes);
 
     // Draw the complete visualizer window
     void drawVisualizerWindow(bool* p_open = nullptr);

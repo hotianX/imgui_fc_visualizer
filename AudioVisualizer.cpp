@@ -275,6 +275,37 @@ void AudioVisualizer::updateChannelAmplitudes(const short* samples, int sample_c
     }
 }
 
+void AudioVisualizer::updateChannelAmplitudesFromAPU(const int* amplitudes) {
+    std::lock_guard<std::mutex> lock(audio_mutex_);
+    
+    // NES APU amplitude ranges:
+    // Square 1/2: 0-15 (4-bit volume)
+    // Triangle: 0-15 (output level)
+    // Noise: 0-15 (4-bit volume)
+    // DMC: 0-127 (7-bit DAC)
+    
+    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+        int amp = std::abs(amplitudes[i]);
+        float normalized;
+        
+        if (i == static_cast<int>(NesChannel::DMC)) {
+            // DMC uses 7-bit DAC (0-127)
+            normalized = amp / 127.0f;
+        } else {
+            // Square, Triangle, Noise use 0-15 range
+            normalized = amp / 15.0f;
+        }
+        
+        // Apply some smoothing (decay old value, blend with new)
+        channel_amplitudes_[i] = std::max(channel_amplitudes_[i] * 0.8f, normalized);
+        
+        // Update peaks
+        if (channel_amplitudes_[i] > channel_peaks_[i]) {
+            channel_peaks_[i] = channel_amplitudes_[i];
+        }
+    }
+}
+
 void AudioVisualizer::decayPeaks(float delta_time) {
     float decay = std::pow(peak_decay_rate_, delta_time * 60.0f);
     
