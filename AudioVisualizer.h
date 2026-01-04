@@ -9,14 +9,22 @@
 #include <cmath>
 #include <complex>
 
-// NES APU channel types
+// NES APU channel types (base + expansion chips)
 enum class NesChannel {
+    // Base APU (5 channels)
     Square1 = 0,
     Square2 = 1,
     Triangle = 2,
     Noise = 3,
     DMC = 4,
-    Count = 5
+    // VRC6 expansion (3 channels)
+    VRC6_Pulse1 = 5,
+    VRC6_Pulse2 = 6,
+    VRC6_Saw = 7,
+    // Counts
+    BaseCount = 5,
+    VRC6Count = 3,
+    MaxCount = 8
 };
 
 // Channel names
@@ -25,7 +33,10 @@ inline const char* const ChannelNames[] = {
     "Square 2",
     "Triangle",
     "Noise",
-    "DMC"
+    "DMC",
+    "VRC6 Pulse1",
+    "VRC6 Pulse2",
+    "VRC6 Saw"
 };
 
 // Channel colors (RGBA)
@@ -34,7 +45,10 @@ inline const ImVec4 ChannelColors[] = {
     ImVec4(1.0f, 0.6f, 0.2f, 1.0f),  // Square 2 - Orange
     ImVec4(0.3f, 0.7f, 1.0f, 1.0f),  // Triangle - Blue
     ImVec4(0.9f, 0.3f, 0.9f, 1.0f),  // Noise - Magenta
-    ImVec4(0.9f, 0.9f, 0.3f, 1.0f)   // DMC - Yellow
+    ImVec4(0.9f, 0.9f, 0.3f, 1.0f),  // DMC - Yellow
+    ImVec4(0.2f, 0.9f, 0.5f, 1.0f),  // VRC6 Pulse1 - Green
+    ImVec4(0.4f, 0.9f, 0.7f, 1.0f),  // VRC6 Pulse2 - Light Green
+    ImVec4(0.6f, 0.4f, 0.9f, 1.0f)   // VRC6 Saw - Purple
 };
 
 // Simple FFT implementation for spectrum analysis
@@ -63,6 +77,12 @@ public:
     // Update channel amplitudes from APU (for accurate per-channel levels)
     void updateChannelAmplitudesFromAPU(const int* amplitudes);
     void updateChannelAmplitudesFromAPU(const int* amplitudes, const int* lengths);
+    
+    // VRC6 expansion support
+    void setVRC6Enabled(bool enabled) { has_vrc6_ = enabled; }
+    bool hasVRC6() const { return has_vrc6_; }
+    void updateVRC6ChannelAmplitudes(const int* amplitudes);  // 3 VRC6 channels
+    int getActiveChannelCount() const { return has_vrc6_ ? static_cast<int>(NesChannel::MaxCount) : static_cast<int>(NesChannel::BaseCount); }
 
     // Draw the complete visualizer window
     void drawVisualizerWindow(bool* p_open = nullptr);
@@ -102,8 +122,11 @@ private:
     std::vector<std::vector<float>> spectrum_history_; // History for waterfall
     
     // Per-channel amplitude (estimated from mixed output)
-    std::array<float, static_cast<size_t>(NesChannel::Count)> channel_amplitudes_;
-    std::array<float, static_cast<size_t>(NesChannel::Count)> channel_peaks_;
+    std::array<float, static_cast<size_t>(NesChannel::MaxCount)> channel_amplitudes_;
+    std::array<float, static_cast<size_t>(NesChannel::MaxCount)> channel_peaks_;
+    
+    // Expansion chip flags
+    bool has_vrc6_;
     
     // Thread safety
     std::mutex audio_mutex_;

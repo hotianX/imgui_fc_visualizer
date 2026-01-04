@@ -52,6 +52,8 @@ public:
 	Nsf_Emu();
 	~Nsf_Emu();
 	Nes_Apu* apu_() { return &apu; }
+	class Nes_Vrc6_Apu* vrc6_() { return vrc6; }
+	bool has_vrc6() const { return vrc6 != 0; }
 protected:
 	blargg_err_t track_info_( track_info_t*, int track ) const;
 	blargg_err_t load_( Data_Reader& );

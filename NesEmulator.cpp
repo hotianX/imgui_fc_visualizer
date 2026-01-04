@@ -63,6 +63,11 @@ void NesEmulator::initApu() {
     apu_.dmc_reader(apuDmcReadCallback, this);
     apu_.reset(false);  // NTSC mode
     
+    // Set up VRC6 APU (will be enabled if game uses mapper 24/26)
+    vrc6_apu_.output(&apu_buffer_);
+    vrc6_apu_.reset();
+    has_vrc6_ = false;
+    
     last_apu_cycle_ = 0;
 }
 
@@ -91,13 +96,25 @@ bool NesEmulator::loadROMData(const void* data, size_t size) {
     
     // Reset APU
     apu_.reset(false);
+    vrc6_apu_.reset();
     apu_buffer_.clear();
     last_apu_cycle_ = 0;
     
     // Load ROM into agnes
     if (!agnes_load_ines_data(agnes_, const_cast<void*>(data), size)) {
         rom_loaded_ = false;
+        has_vrc6_ = false;
         return false;
+    }
+    
+    // Check if this ROM uses VRC6 mapper (24 or 26)
+    // Parse iNES header to get mapper number
+    const uint8_t* header = static_cast<const uint8_t*>(data);
+    if (size >= 16 && header[0] == 'N' && header[1] == 'E' && header[2] == 'S' && header[3] == 0x1A) {
+        uint8_t mapper_num = ((header[6] & 0xF0) >> 4) | (header[7] & 0xF0);
+        has_vrc6_ = (mapper_num == 24 || mapper_num == 26);
+    } else {
+        has_vrc6_ = false;
     }
     
     rom_loaded_ = true;
@@ -161,8 +178,29 @@ void NesEmulator::apuWriteCallback(void* user_data, uint16_t addr, uint8_t val, 
     // Sync APU to current cycle
     emu->syncApu(cpu_cycle);
     
-    // Write to APU
-    emu->apu_.write_register(static_cast<nes_time_t>(cpu_cycle - emu->last_apu_cycle_), addr, val);
+    nes_time_t time = static_cast<nes_time_t>(cpu_cycle - emu->last_apu_cycle_);
+    
+    // Check if this is a VRC6 register write
+    if (emu->has_vrc6_) {
+        // VRC6 Pulse 1: $9000-$9002
+        if (addr >= 0x9000 && addr <= 0x9002) {
+            emu->vrc6_apu_.write_osc(time, 0, addr & 0x3, val);
+            return;
+        }
+        // VRC6 Pulse 2: $A000-$A002
+        if (addr >= 0xA000 && addr <= 0xA002) {
+            emu->vrc6_apu_.write_osc(time, 1, addr & 0x3, val);
+            return;
+        }
+        // VRC6 Saw: $B000-$B002
+        if (addr >= 0xB000 && addr <= 0xB002) {
+            emu->vrc6_apu_.write_osc(time, 2, addr & 0x3, val);
+            return;
+        }
+    }
+    
+    // Standard APU register write
+    emu->apu_.write_register(time, addr, val);
 }
 
 uint8_t NesEmulator::apuReadCallback(void* user_data, uint16_t addr, uint64_t cpu_cycle) {
@@ -201,6 +239,9 @@ void NesEmulator::endApuFrame() {
     nes_time_t frame_length = static_cast<nes_time_t>(current_cycle - last_apu_cycle_);
     
     apu_.end_frame(frame_length);
+    if (has_vrc6_) {
+        vrc6_apu_.end_frame(frame_length);
+    }
     apu_buffer_.end_frame(frame_length);
     
     last_apu_cycle_ = current_cycle;
@@ -228,6 +269,18 @@ void NesEmulator::getApuState(int* periods, int* lengths, int* amplitudes) {
         periods[i] = apu_.osc_period(i);
         lengths[i] = apu_.osc_length(i);
         amplitudes[i] = apu_.osc_amplitude(i);
+    }
+}
+
+void NesEmulator::getVRC6State(int* periods, int* volumes, bool* enabled) {
+    if (!has_vrc6_) return;
+    
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    for (int i = 0; i < 3; ++i) {
+        periods[i] = vrc6_apu_.osc_period(i);
+        volumes[i] = vrc6_apu_.osc_volume(i);
+        enabled[i] = vrc6_apu_.osc_enabled(i);
     }
 }
 

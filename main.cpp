@@ -17,6 +17,7 @@
 #include "gme/gme.h"
 #include "gme/Nsf_Emu.h"
 #include "gme/Nes_Apu.h"
+#include "gme/Nes_Vrc6_Apu.h"
 
 // Native File Dialog for file selection
 #include "nfd.h"
@@ -130,6 +131,26 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
         float current_time = static_cast<float>(state.nes_emu.getCpuCycles()) / 1789773.0f;
         state.piano.updateFromAPU(periods, lengths, amplitudes, current_time);
         
+        // VRC6 expansion support for NES emulator
+        if (state.nes_emu.hasVRC6()) {
+            state.visualizer.setVRC6Enabled(true);
+            state.piano.setVRC6Enabled(true);
+            
+            int vrc6_periods[3], vrc6_volumes[3];
+            bool vrc6_enabled[3];
+            state.nes_emu.getVRC6State(vrc6_periods, vrc6_volumes, vrc6_enabled);
+            
+            int vrc6_amplitudes[3];
+            for (int i = 0; i < 3; ++i) {
+                vrc6_amplitudes[i] = vrc6_enabled[i] ? vrc6_volumes[i] : 0;
+            }
+            state.visualizer.updateVRC6ChannelAmplitudes(vrc6_amplitudes);
+            state.piano.updateFromVRC6(vrc6_periods, vrc6_volumes, vrc6_enabled, current_time);
+        } else {
+            state.visualizer.setVRC6Enabled(false);
+            state.piano.setVRC6Enabled(false);
+        }
+        
         // Convert mono to stereo float output
         float volume_linear = std::pow(10.0f, state.volume_db / 20.0f);
         for (int i = 0; i < num_frames; ++i) {
@@ -187,6 +208,31 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
             }
             state.visualizer.updateChannelAmplitudesFromAPU(amplitudes, lengths);
             state.piano.updateFromAPU(periods, lengths, amplitudes, current_time);
+        }
+        
+        // VRC6 expansion chip support
+        Nes_Vrc6_Apu* vrc6 = nsf->vrc6_();
+        if (vrc6) {
+            // Enable VRC6 mode in visualizers
+            state.visualizer.setVRC6Enabled(true);
+            state.piano.setVRC6Enabled(true);
+            
+            // Get VRC6 channel data
+            int vrc6_amplitudes[3];
+            int vrc6_periods[3];
+            int vrc6_volumes[3];
+            bool vrc6_enabled[3];
+            for (int i = 0; i < 3; ++i) {
+                vrc6_periods[i] = vrc6->osc_period(i);
+                vrc6_amplitudes[i] = vrc6->osc_amplitude(i);
+                vrc6_volumes[i] = vrc6->osc_volume(i);
+                vrc6_enabled[i] = vrc6->osc_enabled(i);
+            }
+            state.visualizer.updateVRC6ChannelAmplitudes(vrc6_amplitudes);
+            state.piano.updateFromVRC6(vrc6_periods, vrc6_volumes, vrc6_enabled, current_time);
+        } else {
+            state.visualizer.setVRC6Enabled(false);
+            state.piano.setVRC6Enabled(false);
         }
     }
     

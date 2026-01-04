@@ -30,6 +30,29 @@ public:
 	enum { addr_step = 0x1000 };
 	void write_osc( blip_time_t, int osc, int reg, int data );
 	
+	// Visualization accessors
+	int osc_period( int osc ) const {
+		if ((unsigned)osc < osc_count) return oscs[osc].period();
+		return 0;
+	}
+	int osc_amplitude( int osc ) const {
+		if ((unsigned)osc < osc_count) return oscs[osc].last_amp;
+		return 0;
+	}
+	// For pulse: volume from reg[0] & 0x0F
+	// For saw: accumulator rate from reg[0] & 0x3F
+	int osc_volume( int osc ) const {
+		if ((unsigned)osc < osc_count) {
+			if (osc < 2) return oscs[osc].regs[0] & 0x0F;  // Pulse volume
+			else return oscs[osc].regs[0] & 0x3F;          // Saw accumulator rate
+		}
+		return 0;
+	}
+	bool osc_enabled( int osc ) const {
+		if ((unsigned)osc < osc_count) return (oscs[osc].regs[2] & 0x80) != 0;
+		return false;
+	}
+	
 public:
 	Nes_Vrc6_Apu();
 	BLARGG_DISABLE_NOTHROW

@@ -83,6 +83,7 @@ AudioVisualizer::AudioVisualizer()
     , spectrum_smoothing_(0.7f)
     , spectrum_history_pos_(0)
     , peak_decay_rate_(0.95f)
+    , has_vrc6_(false)
 {
     // Initialize buffers
     waveform_buffer_.resize(WAVEFORM_SIZE, 0.0f);
@@ -259,7 +260,7 @@ void AudioVisualizer::updateChannelAmplitudes(const short* samples, int sample_c
     // Distribute amplitude across channels (estimation)
     // In reality, we'd need separate channel buffers from the APU
     // For now, we simulate based on frequency content
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < static_cast<int>(NesChannel::BaseCount); ++i) {
         // Decay existing amplitude
         channel_amplitudes_[i] *= 0.9f;
         
@@ -280,7 +281,7 @@ void AudioVisualizer::updateChannelAmplitudesFromAPU(const int* amplitudes) {
     // This version doesn't know if channels are actually active
     std::lock_guard<std::mutex> lock(audio_mutex_);
     
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < static_cast<int>(NesChannel::BaseCount); ++i) {
         int amp = std::abs(amplitudes[i]);
         float normalized = 0.0f;
         
@@ -315,7 +316,7 @@ void AudioVisualizer::updateChannelAmplitudesFromAPU(const int* amplitudes, cons
     // Noise: last_amp is actual output amplitude, reflects volume  
     // DMC: last_amp is DAC value (0-127), doesn't reset when stopped
     
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < static_cast<int>(NesChannel::BaseCount); ++i) {
         float normalized = 0.0f;
         bool use_averaging = false;  // Use averaging instead of max for some channels
         
@@ -356,6 +357,38 @@ void AudioVisualizer::updateChannelAmplitudesFromAPU(const int* amplitudes, cons
         // Update peaks
         if (channel_amplitudes_[i] > channel_peaks_[i]) {
             channel_peaks_[i] = channel_amplitudes_[i];
+        }
+    }
+}
+
+void AudioVisualizer::updateVRC6ChannelAmplitudes(const int* amplitudes) {
+    if (!has_vrc6_) return;
+    
+    std::lock_guard<std::mutex> lock(audio_mutex_);
+    
+    // VRC6 channels: Pulse1, Pulse2, Saw
+    // Pulse1/Pulse2: 4-bit volume (0-15)
+    // Saw: accumulator output (0-31 typical)
+    
+    for (int i = 0; i < static_cast<int>(NesChannel::VRC6Count); ++i) {
+        int channel_idx = static_cast<int>(NesChannel::VRC6_Pulse1) + i;
+        int amp = std::abs(amplitudes[i]);
+        float normalized;
+        
+        if (i == 2) {
+            // Saw wave - uses accumulator, typical range 0-31
+            normalized = std::min(1.0f, amp / 31.0f);
+        } else {
+            // Pulse waves - 4-bit volume (0-15)
+            normalized = amp / 15.0f;
+        }
+        
+        // Apply smoothing
+        channel_amplitudes_[channel_idx] = std::max(channel_amplitudes_[channel_idx] * 0.85f, normalized);
+        
+        // Update peaks
+        if (channel_amplitudes_[channel_idx] > channel_peaks_[channel_idx]) {
+            channel_peaks_[channel_idx] = channel_amplitudes_[channel_idx];
         }
     }
 }
@@ -607,10 +640,11 @@ void AudioVisualizer::drawVolumeMeters(float width, float height) {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     ImVec2 start_pos = ImGui::GetCursorScreenPos();
     
-    float meter_width = (width - 20) / static_cast<float>(NesChannel::Count);
+    int channel_count = getActiveChannelCount();
+    float meter_width = (width - 20) / static_cast<float>(channel_count);
     float meter_height = height - 20;
     
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < channel_count; ++i) {
         float x = start_pos.x + i * (meter_width + 4);
         float y = start_pos.y;
         
@@ -661,20 +695,23 @@ void AudioVisualizer::drawVolumeMeters(float width, float height) {
     
     // Channel labels below
     ImGui::Dummy(ImVec2(width, meter_height + 5));
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < channel_count; ++i) {
         if (i > 0) ImGui::SameLine();
         float label_width = meter_width - 4;
         ImGui::PushItemWidth(label_width);
-        ImGui::TextColored(ChannelColors[i], "%s", ChannelNames[i]);
+        // Use shorter names for VRC6 channels to fit
+        const char* short_names[] = {"Sq1", "Sq2", "Tri", "Noi", "DMC", "V-P1", "V-P2", "V-Saw"};
+        ImGui::TextColored(ChannelColors[i], "%s", channel_count > 5 ? short_names[i] : ChannelNames[i]);
         ImGui::PopItemWidth();
     }
 }
 
 void AudioVisualizer::drawChannelInfo() {
     // Display channel mute toggles
-    ImGui::Columns(5, "channel_controls", false);
+    int channel_count = getActiveChannelCount();
+    ImGui::Columns(channel_count, "channel_controls", false);
     
-    for (int i = 0; i < static_cast<int>(NesChannel::Count); ++i) {
+    for (int i = 0; i < channel_count; ++i) {
         NesChannel channel = static_cast<NesChannel>(i);
         bool muted = isChannelMuted(channel);
         

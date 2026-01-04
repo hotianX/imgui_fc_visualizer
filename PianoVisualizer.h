@@ -11,10 +11,11 @@
 // Forward declarations
 struct Music_Emu;
 class Nes_Apu;
+class Nes_Vrc6_Apu;
 
 // NES APU channel info for piano visualization
 struct NesNoteInfo {
-    int channel;        // 0-4: Square1, Square2, Triangle, Noise, DMC
+    int channel;        // 0-7: Square1, Square2, Triangle, Noise, DMC, VRC6_Pulse1, VRC6_Pulse2, VRC6_Saw
     int midi_note;      // MIDI note number (0-127)
     float velocity;     // 0.0 - 1.0
     bool active;        // Is the note currently playing
@@ -29,17 +30,25 @@ struct PianoRollNote {
     float end_time;     // In seconds (when note ends)
 };
 
+// Maximum channel count (base APU + VRC6)
+constexpr int PIANO_NUM_CHANNELS_BASE = 5;
+constexpr int PIANO_NUM_CHANNELS_VRC6 = 3;
+constexpr int PIANO_NUM_CHANNELS_MAX = 8;
+
 // Channel colors for piano visualization
 inline const ImU32 PianoChannelColors[] = {
     IM_COL32(255, 80, 80, 220),   // Square 1 - Red
     IM_COL32(255, 160, 60, 220),  // Square 2 - Orange
     IM_COL32(80, 180, 255, 220),  // Triangle - Blue
     IM_COL32(230, 80, 230, 220),  // Noise - Magenta
-    IM_COL32(230, 230, 80, 220)   // DMC - Yellow
+    IM_COL32(230, 230, 80, 220),  // DMC - Yellow
+    IM_COL32(60, 230, 130, 220),  // VRC6 Pulse1 - Green
+    IM_COL32(100, 230, 180, 220), // VRC6 Pulse2 - Light Green
+    IM_COL32(150, 100, 230, 220)  // VRC6 Saw - Purple
 };
 
 inline const char* PianoChannelNames[] = {
-    "Sq1", "Sq2", "Tri", "Noi", "DMC"
+    "Sq1", "Sq2", "Tri", "Noi", "DMC", "V-P1", "V-P2", "V-Saw"
 };
 
 // Callback type for getting APU data during preprocessing
@@ -71,6 +80,12 @@ public:
     
     // Update with NES APU register data for live keyboard highlighting
     void updateFromAPU(const int* periods, const int* lengths, const int* amplitudes, float current_time);
+    
+    // VRC6 support
+    void setVRC6Enabled(bool enabled) { has_vrc6_ = enabled; }
+    bool hasVRC6() const { return has_vrc6_; }
+    void updateFromVRC6(const int* periods, const int* volumes, const bool* enabled, float current_time);
+    int getActiveChannelCount() const { return has_vrc6_ ? PIANO_NUM_CHANNELS_MAX : PIANO_NUM_CHANNELS_BASE; }
 
     // Draw the piano keyboard
     void drawPianoKeyboard(const char* label, float width, float height);
@@ -87,23 +102,23 @@ public:
 
 private:
     // Constants
-    static constexpr int NUM_CHANNELS = 5;
     static constexpr int MIDI_NOTE_MIN = 21;   // A0
     static constexpr int MIDI_NOTE_MAX = 108;  // C8
     static constexpr float NES_CPU_CLOCK = 1789773.0f;  // NTSC
 
     // Current note state per channel (for live keyboard display)
-    std::array<NesNoteInfo, NUM_CHANNELS> current_notes_;
+    std::array<NesNoteInfo, PIANO_NUM_CHANNELS_MAX> current_notes_;
     
     // Preprocessed note data (sorted by start_time)
     std::vector<PianoRollNote> preprocessed_notes_;
     bool has_preprocessed_data_ = false;
     float track_duration_ = 0.0f;
+    bool has_vrc6_ = false;
     
     // For preprocessing: track note state
-    std::array<int, NUM_CHANNELS> preprocess_prev_notes_;
-    std::array<float, NUM_CHANNELS> preprocess_note_start_;
-    std::array<float, NUM_CHANNELS> preprocess_note_velocity_;
+    std::array<int, PIANO_NUM_CHANNELS_MAX> preprocess_prev_notes_;
+    std::array<float, PIANO_NUM_CHANNELS_MAX> preprocess_note_start_;
+    std::array<float, PIANO_NUM_CHANNELS_MAX> preprocess_note_velocity_;
     
     // Settings
     float piano_roll_seconds_ = 3.0f;  // How many seconds of future notes to show

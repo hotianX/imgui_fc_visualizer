@@ -15,7 +15,7 @@ PianoVisualizer::PianoVisualizer() {
 void PianoVisualizer::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    for (int i = 0; i < NUM_CHANNELS; ++i) {
+    for (int i = 0; i < PIANO_NUM_CHANNELS_MAX; ++i) {
         current_notes_[i] = {i, 0, 0.0f, false};
         preprocess_prev_notes_[i] = -1;
         preprocess_note_start_[i] = 0.0f;
@@ -80,7 +80,7 @@ int PianoVisualizer::periodToMidi(int channel, int period) {
 }
 
 void PianoVisualizer::processApuFrame(const int* periods, const int* lengths, const int* amplitudes, float current_time) {
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    for (int ch = 0; ch < PIANO_NUM_CHANNELS_BASE; ++ch) {
         int period = periods[ch];
         int length = lengths[ch];
         int amp = std::abs(amplitudes[ch]);
@@ -150,7 +150,7 @@ void PianoVisualizer::processApuFrame(const int* periods, const int* lengths, co
 
 void PianoVisualizer::finalizePreprocessing(float end_time) {
     // End any notes still playing
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    for (int ch = 0; ch < PIANO_NUM_CHANNELS_MAX; ++ch) {
         int prev_note = preprocess_prev_notes_[ch];
         if (prev_note >= 0 && prev_note <= 127) {
             PianoRollNote note;
@@ -188,8 +188,9 @@ bool PianoVisualizer::preprocessTrack(Music_Emu* emu, int track, long sample_rat
     preprocessed_notes_.clear();
     has_preprocessed_data_ = false;
     track_duration_ = 0.0f;
+    has_vrc6_ = false;
     
-    for (int i = 0; i < NUM_CHANNELS; ++i) {
+    for (int i = 0; i < PIANO_NUM_CHANNELS_MAX; ++i) {
         preprocess_prev_notes_[i] = -1;
         preprocess_note_start_[i] = 0.0f;
         preprocess_note_velocity_[i] = 0.0f;
@@ -260,7 +261,7 @@ void PianoVisualizer::updatePlaybackTime(float current_time) {
     std::lock_guard<std::mutex> lock(mutex_);
     
     // Update current notes based on preprocessed data
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    for (int ch = 0; ch < PIANO_NUM_CHANNELS_MAX; ++ch) {
         current_notes_[ch].active = false;
     }
     
@@ -268,7 +269,7 @@ void PianoVisualizer::updatePlaybackTime(float current_time) {
     for (const auto& note : preprocessed_notes_) {
         if (note.start_time <= current_time && note.end_time > current_time) {
             int ch = note.channel;
-            if (ch >= 0 && ch < NUM_CHANNELS) {
+            if (ch >= 0 && ch < PIANO_NUM_CHANNELS_MAX) {
                 current_notes_[ch].midi_note = note.midi_note;
                 current_notes_[ch].velocity = note.velocity;
                 current_notes_[ch].active = true;
@@ -280,8 +281,8 @@ void PianoVisualizer::updatePlaybackTime(float current_time) {
 void PianoVisualizer::updateFromAPU(const int* periods, const int* lengths, const int* amplitudes, float current_time) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Update current notes for live keyboard display
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    // Update current notes for live keyboard display (base APU channels only)
+    for (int ch = 0; ch < PIANO_NUM_CHANNELS_BASE; ++ch) {
         int period = periods[ch];
         int length = lengths[ch];
         int amp = std::abs(amplitudes[ch]);
@@ -313,6 +314,46 @@ void PianoVisualizer::updateFromAPU(const int* periods, const int* lengths, cons
                 float freq = NES_CPU_CLOCK / (16.0f * (period + 1));
                 midi_note = frequencyToMidi(freq);
                 velocity = std::min(1.0f, amp / 15.0f);
+            }
+        }
+        
+        if (midi_note >= 0 && midi_note <= 127 && velocity > 0.01f) {
+            current_notes_[ch].midi_note = midi_note;
+            current_notes_[ch].velocity = velocity;
+            current_notes_[ch].active = true;
+        } else {
+            current_notes_[ch].active = false;
+        }
+    }
+}
+
+void PianoVisualizer::updateFromVRC6(const int* periods, const int* volumes, const bool* enabled, float current_time) {
+    if (!has_vrc6_) return;
+    
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // VRC6 channels: Pulse1 (5), Pulse2 (6), Saw (7)
+    for (int i = 0; i < PIANO_NUM_CHANNELS_VRC6; ++i) {
+        int ch = PIANO_NUM_CHANNELS_BASE + i;  // 5, 6, 7
+        int period = periods[i];
+        int volume = volumes[i];
+        bool is_enabled = enabled[i];
+        
+        int midi_note = -1;
+        float velocity = 0;
+        
+        if (is_enabled && volume > 0 && period >= 1) {
+            // VRC6 period formula: freq = CPU_CLOCK / (16 * (period + 1))
+            // Same as NES square waves
+            float freq = NES_CPU_CLOCK / (16.0f * (period + 1));
+            midi_note = frequencyToMidi(freq);
+            
+            if (i < 2) {
+                // Pulse waves - 4-bit volume (0-15)
+                velocity = std::min(1.0f, volume / 15.0f);
+            } else {
+                // Saw wave - accumulator rate (0-63)
+                velocity = std::min(1.0f, volume / 42.0f);  // Typical max is around 42
             }
         }
         
@@ -376,7 +417,7 @@ void PianoVisualizer::drawPianoKeyboard(const char* label, float width, float he
     note_channel.fill(-1);
     note_velocity.fill(0.0f);
     
-    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    for (int ch = 0; ch < getActiveChannelCount(); ++ch) {
         if (current_notes_[ch].active && current_notes_[ch].midi_note >= 0 && 
             current_notes_[ch].midi_note < 128) {
             int note = current_notes_[ch].midi_note;
@@ -599,7 +640,7 @@ void PianoVisualizer::drawPianoWindow(bool* p_open, float current_time) {
     }
     
     ImGui::SameLine(150);
-    for (int i = 0; i < NUM_CHANNELS; ++i) {
+    for (int i = 0; i < getActiveChannelCount(); ++i) {
         ImVec4 color = ImGui::ColorConvertU32ToFloat4(PianoChannelColors[i]);
         ImGui::ColorButton(PianoChannelNames[i], color, ImGuiColorEditFlags_NoTooltip, ImVec2(16, 14));
         ImGui::SameLine();

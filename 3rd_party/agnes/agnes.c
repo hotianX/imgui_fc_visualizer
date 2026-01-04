@@ -220,6 +220,40 @@ typedef struct mapper4 {
     uint8_t chr_ram[8 * 1024];
 } mapper4_t;
 
+// VRC6 mapper (mapper 24 and 26)
+typedef struct mapper24 {
+    struct agnes *agnes;
+    
+    // PRG banking
+    unsigned prg_bank_16k;     // $8000-$BFFF (16KB switchable)
+    unsigned prg_bank_8k;      // $C000-$DFFF (8KB switchable)
+    unsigned prg_bank_offsets[4];  // $8000, $A000, $C000, $E000
+    
+    // CHR banking (1KB banks)
+    unsigned chr_bank_offsets[8];
+    
+    // Mirroring control
+    uint8_t ppu_ctrl;
+    
+    // IRQ
+    uint8_t irq_latch;
+    uint8_t irq_counter;
+    bool irq_enabled;
+    bool irq_enabled_after_ack;
+    uint8_t irq_mode;
+    uint8_t irq_prescaler;
+    
+    // PRG RAM
+    uint8_t prg_ram[8 * 1024];
+    
+    // CHR RAM (if no CHR ROM)
+    bool use_chr_ram;
+    uint8_t chr_ram[8 * 1024];
+    
+    // Mapper variant: 24 or 26 (address lines A0/A1 are swapped)
+    bool is_vrc6b;  // true for mapper 26
+} mapper24_t;
+
 /********************************* GAMEPACK **********************************/
 
 typedef struct {
@@ -253,6 +287,7 @@ typedef struct agnes {
         mapper1_t m1;
         mapper2_t m2;
         mapper4_t m4;
+        mapper24_t m24;
     } mapper;
 
     mirroring_mode_t mirroring_mode;
@@ -606,6 +641,7 @@ void agnes_dump_state(const agnes_t *agnes, agnes_state_t *out_res) {
         case 1: out_res->agnes.mapper.m1.agnes = NULL; break;
         case 2: out_res->agnes.mapper.m2.agnes = NULL; break;
         case 4: out_res->agnes.mapper.m4.agnes = NULL; break;
+        case 24: case 26: out_res->agnes.mapper.m24.agnes = NULL; break;
     }
 }
 
@@ -620,6 +656,7 @@ bool agnes_restore_state(agnes_t *agnes, const agnes_state_t *state) {
         case 1: agnes->mapper.m1.agnes = agnes; break;
         case 2: agnes->mapper.m2.agnes = agnes; break;
         case 4: agnes->mapper.m4.agnes = agnes; break;
+        case 24: case 26: agnes->mapper.m24.agnes = agnes; break;
     }
     return true;
 }
@@ -2210,12 +2247,20 @@ static int take_branch(cpu_t *cpu, uint16_t addr) {
 #include "mapper4.h"
 #endif
 
+// Forward declarations for mapper24 (VRC6)
+static void mapper24_init(mapper24_t *mapper, agnes_t *agnes);
+static uint8_t mapper24_read(mapper24_t *mapper, uint16_t addr);
+static void mapper24_write(mapper24_t *mapper, uint16_t addr, uint8_t val);
+static void mapper24_cpu_cycle(mapper24_t *mapper);
+
 bool mapper_init(agnes_t *agnes) {
     switch (agnes->gamepack.mapper) {
         case 0: mapper0_init(&agnes->mapper.m0, agnes); return true;
         case 1: mapper1_init(&agnes->mapper.m1, agnes); return true;
         case 2: mapper2_init(&agnes->mapper.m2, agnes); return true;
         case 4: mapper4_init(&agnes->mapper.m4, agnes); return true;
+        case 24: mapper24_init(&agnes->mapper.m24, agnes); agnes->mapper.m24.is_vrc6b = false; return true;
+        case 26: mapper24_init(&agnes->mapper.m24, agnes); agnes->mapper.m24.is_vrc6b = true; return true;
         default: return false;
     }
 }
@@ -2226,6 +2271,7 @@ uint8_t mapper_read(agnes_t *agnes, uint16_t addr) {
         case 1: return mapper1_read(&agnes->mapper.m1, addr);
         case 2: return mapper2_read(&agnes->mapper.m2, addr);
         case 4: return mapper4_read(&agnes->mapper.m4, addr);
+        case 24: case 26: return mapper24_read(&agnes->mapper.m24, addr);
         default: return 0;
     }
 }
@@ -2236,6 +2282,7 @@ void mapper_write(agnes_t *agnes, uint16_t addr, uint8_t val) {
         case 1: mapper1_write(&agnes->mapper.m1, addr, val); break;
         case 2: mapper2_write(&agnes->mapper.m2, addr, val); break;
         case 4: mapper4_write(&agnes->mapper.m4, addr, val); break;
+        case 24: case 26: mapper24_write(&agnes->mapper.m24, addr, val); break;
     }
 }
 
@@ -2605,6 +2652,198 @@ static void mapper4_set_offsets(mapper4_t *mapper) {
             mapper->prg_bank_offsets[2] = mapper->regs[6] * (8 * 1024);
             mapper->prg_bank_offsets[3] = (mapper->agnes->gamepack.prg_rom_banks_count - 1) * (16 * 1024) + (8 * 1024);
             break;
+        }
+    }
+}
+//FILE_END
+
+//FILE_START:mapper24.c
+// VRC6 mapper (mapper 24/26) implementation
+
+static void mapper24_set_offsets(mapper24_t *mapper);
+
+static void mapper24_init(mapper24_t *mapper, agnes_t *agnes) {
+    mapper->agnes = agnes;
+    
+    mapper->prg_bank_16k = 0;
+    mapper->prg_bank_8k = 0;
+    mapper->ppu_ctrl = 0;
+    
+    mapper->irq_latch = 0;
+    mapper->irq_counter = 0;
+    mapper->irq_enabled = false;
+    mapper->irq_enabled_after_ack = false;
+    mapper->irq_mode = 0;
+    mapper->irq_prescaler = 0;
+    
+    mapper->use_chr_ram = agnes->gamepack.chr_rom_banks_count == 0;
+    
+    for (int i = 0; i < 8; ++i) {
+        mapper->chr_bank_offsets[i] = i * 1024;
+    }
+    
+    mapper24_set_offsets(mapper);
+}
+
+static uint8_t mapper24_read(mapper24_t *mapper, uint16_t addr) {
+    uint8_t res = 0;
+    
+    if (addr < 0x2000) {
+        // CHR ROM/RAM
+        int bank = (addr >> 10) & 0x7;
+        unsigned bank_offset = mapper->chr_bank_offsets[bank];
+        unsigned addr_offset = addr & 0x3ff;
+        unsigned offset = bank_offset + addr_offset;
+        
+        if (mapper->use_chr_ram) {
+            offset = offset & ((8 * 1024) - 1);
+            res = mapper->chr_ram[offset];
+        } else {
+            unsigned chr_size = mapper->agnes->gamepack.chr_rom_banks_count * 8 * 1024;
+            offset = offset % chr_size;
+            res = mapper->agnes->gamepack.data[mapper->agnes->gamepack.chr_rom_offset + offset];
+        }
+    } else if (addr >= 0x6000 && addr < 0x8000) {
+        // PRG RAM
+        res = mapper->prg_ram[addr - 0x6000];
+    } else if (addr >= 0x8000) {
+        // PRG ROM
+        int bank = (addr >> 13) & 0x3;
+        unsigned bank_offset = mapper->prg_bank_offsets[bank];
+        unsigned addr_offset = addr & 0x1fff;
+        unsigned offset = mapper->agnes->gamepack.prg_rom_offset + bank_offset + addr_offset;
+        res = mapper->agnes->gamepack.data[offset];
+    }
+    
+    return res;
+}
+
+static void mapper24_write(mapper24_t *mapper, uint16_t addr, uint8_t val) {
+    if (addr < 0x2000) {
+        // CHR RAM
+        if (mapper->use_chr_ram) {
+            int bank = (addr >> 10) & 0x7;
+            unsigned bank_offset = mapper->chr_bank_offsets[bank];
+            unsigned addr_offset = addr & 0x3ff;
+            unsigned offset = (bank_offset + addr_offset) & ((8 * 1024) - 1);
+            mapper->chr_ram[offset] = val;
+        }
+    } else if (addr >= 0x6000 && addr < 0x8000) {
+        // PRG RAM
+        mapper->prg_ram[addr - 0x6000] = val;
+    } else if (addr >= 0x8000) {
+        // For VRC6b (mapper 26), A0 and A1 are swapped
+        uint16_t reg_addr = addr;
+        if (mapper->is_vrc6b) {
+            uint8_t a0 = (addr >> 0) & 1;
+            uint8_t a1 = (addr >> 1) & 1;
+            reg_addr = (addr & 0xFFFC) | (a0 << 1) | (a1 << 0);
+        }
+        
+        // VRC6 register writes
+        if (reg_addr >= 0x8000 && reg_addr <= 0x8003) {
+            // $8000-$8003: 16K PRG bank at $8000-$BFFF
+            mapper->prg_bank_16k = val & 0x0F;
+            mapper24_set_offsets(mapper);
+        } else if (reg_addr >= 0x9000 && reg_addr <= 0x9003) {
+            // $9000-$9002: VRC6 Pulse 1 audio (handled by APU callback)
+            if (mapper->agnes->apu_write) {
+                mapper->agnes->apu_write(mapper->agnes->apu_user_data, reg_addr, val, mapper->agnes->cpu.cycles);
+            }
+        } else if (reg_addr >= 0xA000 && reg_addr <= 0xA003) {
+            // $A000-$A002: VRC6 Pulse 2 audio
+            if (mapper->agnes->apu_write) {
+                mapper->agnes->apu_write(mapper->agnes->apu_user_data, reg_addr, val, mapper->agnes->cpu.cycles);
+            }
+        } else if (reg_addr >= 0xB000 && reg_addr <= 0xB003) {
+            // $B000-$B002: VRC6 Saw audio
+            // $B003: PPU control (mirroring, etc.)
+            if ((reg_addr & 0x3) == 0x3) {
+                mapper->ppu_ctrl = val;
+                // Mirroring: bits 2-3
+                switch ((val >> 2) & 0x3) {
+                    case 0: mapper->agnes->mirroring_mode = MIRRORING_MODE_VERTICAL; break;
+                    case 1: mapper->agnes->mirroring_mode = MIRRORING_MODE_HORIZONTAL; break;
+                    case 2: mapper->agnes->mirroring_mode = MIRRORING_MODE_SINGLE_LOWER; break;
+                    case 3: mapper->agnes->mirroring_mode = MIRRORING_MODE_SINGLE_UPPER; break;
+                }
+            } else {
+                if (mapper->agnes->apu_write) {
+                    mapper->agnes->apu_write(mapper->agnes->apu_user_data, reg_addr, val, mapper->agnes->cpu.cycles);
+                }
+            }
+        } else if (reg_addr >= 0xC000 && reg_addr <= 0xC003) {
+            // $C000-$C003: 8K PRG bank at $C000-$DFFF
+            mapper->prg_bank_8k = val & 0x1F;
+            mapper24_set_offsets(mapper);
+        } else if (reg_addr >= 0xD000 && reg_addr <= 0xD003) {
+            // $D000-$D003: CHR banks 0-3
+            int chr_bank = reg_addr & 0x3;
+            mapper->chr_bank_offsets[chr_bank] = val * 1024;
+        } else if (reg_addr >= 0xE000 && reg_addr <= 0xE003) {
+            // $E000-$E003: CHR banks 4-7
+            int chr_bank = 4 + (reg_addr & 0x3);
+            mapper->chr_bank_offsets[chr_bank] = val * 1024;
+        } else if (reg_addr >= 0xF000 && reg_addr <= 0xF003) {
+            // $F000: IRQ latch low
+            // $F001: IRQ control
+            // $F002: IRQ acknowledge
+            int reg = reg_addr & 0x3;
+            if (reg == 0) {
+                mapper->irq_latch = val;
+            } else if (reg == 1) {
+                mapper->irq_mode = val;
+                mapper->irq_enabled_after_ack = (val & 0x01) != 0;
+                mapper->irq_enabled = (val & 0x02) != 0;
+                if (mapper->irq_enabled) {
+                    mapper->irq_counter = mapper->irq_latch;
+                    mapper->irq_prescaler = 0;
+                }
+            } else if (reg == 2) {
+                // IRQ acknowledge
+                mapper->irq_enabled = mapper->irq_enabled_after_ack;
+            }
+        }
+    }
+}
+
+static void mapper24_set_offsets(mapper24_t *mapper) {
+    unsigned prg_rom_size = mapper->agnes->gamepack.prg_rom_banks_count * 16 * 1024;
+    
+    // $8000-$BFFF: 16K switchable
+    mapper->prg_bank_offsets[0] = (mapper->prg_bank_16k * 16 * 1024) % prg_rom_size;
+    mapper->prg_bank_offsets[1] = mapper->prg_bank_offsets[0] + 8 * 1024;
+    
+    // $C000-$DFFF: 8K switchable
+    mapper->prg_bank_offsets[2] = (mapper->prg_bank_8k * 8 * 1024) % prg_rom_size;
+    
+    // $E000-$FFFF: Fixed to last 8K
+    mapper->prg_bank_offsets[3] = prg_rom_size - 8 * 1024;
+}
+
+static void mapper24_cpu_cycle(mapper24_t *mapper) {
+    if (!mapper->irq_enabled) return;
+    
+    // VRC6 IRQ can run in scanline mode (bit 2 = 0) or cycle mode (bit 2 = 1)
+    if (mapper->irq_mode & 0x04) {
+        // Cycle mode: clock every CPU cycle
+        if (mapper->irq_counter == 0xFF) {
+            mapper->irq_counter = mapper->irq_latch;
+            cpu_trigger_irq(&mapper->agnes->cpu);
+        } else {
+            mapper->irq_counter++;
+        }
+    } else {
+        // Scanline mode: prescaler divides by 114
+        mapper->irq_prescaler++;
+        if (mapper->irq_prescaler >= 114) {
+            mapper->irq_prescaler = 0;
+            if (mapper->irq_counter == 0xFF) {
+                mapper->irq_counter = mapper->irq_latch;
+                cpu_trigger_irq(&mapper->agnes->cpu);
+            } else {
+                mapper->irq_counter++;
+            }
         }
     }
 }

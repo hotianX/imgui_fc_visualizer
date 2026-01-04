@@ -2,6 +2,7 @@
 
 #include "agnes/agnes.h"
 #include "gme/Nes_Apu.h"
+#include "gme/Nes_Vrc6_Apu.h"
 #include "gme/Blip_Buffer.h"
 #include "sokol_gfx.h"
 #include "imgui.h"
@@ -41,6 +42,10 @@ public:
     // Get APU data for visualization
     void getApuState(int* periods, int* lengths, int* amplitudes);
     
+    // VRC6 expansion support
+    bool hasVRC6() const { return has_vrc6_; }
+    void getVRC6State(int* periods, int* volumes, bool* enabled);
+    
     // Get samples available in buffer
     long samplesAvailable() const;
     
@@ -65,8 +70,10 @@ private:
     
     // APU (from gme)
     Nes_Apu apu_;
+    Nes_Vrc6_Apu vrc6_apu_;
     Blip_Buffer apu_buffer_;
     long sample_rate_ = 44100;
+    bool has_vrc6_ = false;
     
     // APU timing
     uint64_t last_apu_cycle_ = 0;
