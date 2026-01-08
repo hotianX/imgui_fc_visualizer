@@ -141,6 +141,7 @@ static struct {
     // Game_Music_Emu state
     Music_Emu* emu = nullptr;
     std::atomic<bool> is_playing{false};
+    std::atomic<bool> track_started{false};  // Whether gme_start_track has been called
     int current_track = 0;
     int track_count = 0;
     char loaded_file[512] = "";
@@ -397,6 +398,7 @@ void safe_start_track(int track) {
     std::lock_guard<std::mutex> lock(audio_mutex);
     state.seek_request.store(-1);  // Clear any pending seek
     gme_start_track(state.emu, track);
+    state.track_started.store(true);  // Track is now initialized
     state.is_playing.store(true);  // Resume playback
 }
 
@@ -414,6 +416,7 @@ void start_track_with_preprocess(int track) {
 void load_nsf_file(const char* path) {
     // Stop playback first
     state.is_playing.store(false);
+    state.track_started.store(false);
     
     // Wait for audio thread to stop using the emulator
     std::lock_guard<std::mutex> lock(audio_mutex);
@@ -963,14 +966,20 @@ void draw_player_window() {
             const char* play_label = state.is_playing.load() ? "||" : ">";
             if (ImGui::Button(play_label, ImVec2(50, 30))) {
                 if (!state.is_playing.load()) {
-                    safe_start_track(state.current_track);  // Same track, no re-preprocessing
+                    // Start track if not started, otherwise just resume
+                    if (!state.track_started.load()) {
+                        safe_start_track(state.current_track);
+                    } else {
+                        state.is_playing.store(true);
+                    }
                 } else {
+                    // Pause playback
                     state.is_playing.store(false);
                 }
             }
             ImGui::SameLine();
             
-            // Stop
+            // Stop (reset to beginning)
             if (ImGui::Button("[]", ImVec2(40, 30))) {
                 state.is_playing.store(false);
                 // Reset to beginning of track
@@ -1168,7 +1177,12 @@ void input(const sapp_event* ev) {
                 // Toggle play/pause
                 if (state.emu) {
                     if (!state.is_playing.load()) {
-                        safe_start_track(state.current_track);  // Same track, no re-preprocessing
+                        // Start track if not started, otherwise just resume
+                        if (!state.track_started.load()) {
+                            safe_start_track(state.current_track);
+                        } else {
+                            state.is_playing.store(true);
+                        }
                     } else {
                         state.is_playing.store(false);
                     }
