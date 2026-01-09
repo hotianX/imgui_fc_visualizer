@@ -20,7 +20,7 @@ add_executable(imgui_fc_visualizer
     NesEmulator.cpp
     NesEmulator.h
 )
-target_link_libraries(imgui_fc_visualizer PRIVATE sokol imgui game_music_emu agnes nfd)
+target_link_libraries(imgui_fc_visualizer PRIVATE sokol imgui game_music_emu agnes nfd TinySoundFont)
 target_compile_options(imgui_fc_visualizer PUBLIC $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<COMPILE_LANGUAGE:CUDA>>>:/wd4819>)
 
 # Include directories for gme headers
@@ -32,3 +32,8 @@ target_include_directories(imgui_fc_visualizer PRIVATE
 if (NOT APPLE)
     target_link_libraries(imgui_fc_visualizer PRIVATE Vulkan::Vulkan)
 endif ()
+
+add_custom_command(
+    TARGET imgui_fc_visualizer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ARGS "${CMAKE_CURRENT_SOURCE_DIR}/SoundFont" "${CMAKE_CURRENT_BINARY_DIR}/SoundFont"
+)
