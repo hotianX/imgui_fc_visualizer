@@ -1200,7 +1200,8 @@ void init(void) {
     audio_config.playback.format     = ma_format_f32;
     audio_config.playback.channels   = 2;
     audio_config.sampleRate          = static_cast<ma_uint32>(state.sample_rate);
-    audio_config.periodSizeInFrames  = 2048;  // ~46ms at 44100 Hz
+    // Use smaller period so callback runs ~86 Hz (512/44100≈11.6ms), matching viz frame rate; 2048 would be ~21 Hz and make viz choppy
+    audio_config.periodSizeInFrames  = 512;
     audio_config.dataCallback        = miniaudio_data_callback;
     audio_config.pUserData           = nullptr;
     audio_config.playback.shareMode  = ma_share_mode_exclusive;  // WASAPI exclusive for bit-perfect output
