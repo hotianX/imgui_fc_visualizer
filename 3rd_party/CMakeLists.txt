@@ -79,3 +79,9 @@ add_subdirectory(nativefiledialog-extended)
 # TinySoundFont
 add_library(TinySoundFont INTERFACE)
 target_include_directories(TinySoundFont INTERFACE TinySoundFont)
+
+# miniaudio
+add_library(miniaudio STATIC
+    miniaudio/miniaudio.c
+)
+target_include_directories(miniaudio PUBLIC miniaudio)

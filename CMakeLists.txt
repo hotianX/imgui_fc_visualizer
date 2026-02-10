@@ -28,7 +28,7 @@ add_executable(imgui_fc_visualizer
     v6502r/ext/perfect6502/netlist_sim.c
     v6502r/ext/perfect6502/perfect2a03.c
 )
-target_link_libraries(imgui_fc_visualizer PRIVATE sokol imgui game_music_emu agnes nfd TinySoundFont)
+target_link_libraries(imgui_fc_visualizer PRIVATE sokol imgui game_music_emu agnes nfd TinySoundFont miniaudio)
 target_compile_options(imgui_fc_visualizer PUBLIC $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<COMPILE_LANGUAGE:CUDA>>>:/wd4819>)
 
 # Include directories for gme headers and v6502r

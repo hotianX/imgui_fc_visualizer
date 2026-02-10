@@ -3,7 +3,6 @@
 #include "sokol_gfx.h"
 #include "sokol_log.h"
 #include "sokol_glue.h"
-#include "sokol_audio.h"
 #include <vector>
 #include <cstring>
 #include <algorithm>
@@ -48,6 +47,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+#include "miniaudio.h"
 
 // UTF-8 file reading helper for Windows
 // Returns true if file was read successfully, data is stored in out_data
@@ -186,6 +187,9 @@ static bool key_states[512] = {};  // Track key press states
 // Mutex for protecting audio operations
 static std::mutex audio_mutex;
 
+// miniaudio device (global so it lives until cleanup)
+static ma_device g_audio_device;
+
 // application state
 static struct {
     sg_pass_action pass_action;
@@ -237,8 +241,8 @@ static struct {
     A2A03Visualizer chip_visualizer;
 } state;
 
-// Audio stream callback - called from audio thread
-void audio_stream_callback(float* buffer, int num_frames, int num_channels, void* user_data) {
+// Fill audio buffer - shared logic used by miniaudio callback (called from audio thread)
+static void fill_audio_buffer(float* buffer, int num_frames, int num_channels) {
     const int num_samples = num_frames * num_channels;
     
     // Handle MIDI Player mode
@@ -449,6 +453,12 @@ void audio_stream_callback(float* buffer, int num_frames, int num_channels, void
     for (int i = 0; i < num_samples; i++) {
         buffer[i] = (temp_buffer[i] / 32768.0f) * volume_linear;
     }
+}
+
+// miniaudio data callback - called from audio thread
+static void miniaudio_data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    (void)pInput;
+    fill_audio_buffer(static_cast<float*>(pOutput), static_cast<int>(frameCount), static_cast<int>(pDevice->playback.channels));
 }
 
 // Helper to get APU from emulator
@@ -1185,17 +1195,21 @@ void init(void) {
 
     state.pass_action.colors[0] = { .load_action=SG_LOADACTION_CLEAR, .clear_value={0.1f, 0.1f, 0.1f, 1.0f } };
     
-    // Initialize sokol_audio with callback model
-    saudio_desc audio_desc = {};
-    audio_desc.sample_rate = state.sample_rate;
-    audio_desc.num_channels = 2; // Stereo
-    audio_desc.buffer_frames = 2048;  // ~46ms latency
-    audio_desc.stream_userdata_cb = audio_stream_callback;
-    audio_desc.user_data = nullptr;
-    audio_desc.logger.func = slog_func;
-    
-    saudio_setup(&audio_desc);
-    state.audio_initialized = saudio_isvalid();
+    // Initialize miniaudio with WASAPI exclusive mode for HiFi playback
+    ma_device_config audio_config = ma_device_config_init(ma_device_type_playback);
+    audio_config.playback.format     = ma_format_f32;
+    audio_config.playback.channels   = 2;
+    audio_config.sampleRate          = static_cast<ma_uint32>(state.sample_rate);
+    audio_config.periodSizeInFrames  = 2048;  // ~46ms at 44100 Hz
+    audio_config.dataCallback        = miniaudio_data_callback;
+    audio_config.pUserData           = nullptr;
+    audio_config.playback.shareMode  = ma_share_mode_exclusive;  // WASAPI exclusive for bit-perfect output
+
+    ma_result audio_result = ma_device_init(NULL, &audio_config, &g_audio_device);
+    state.audio_initialized = (audio_result == MA_SUCCESS);
+    if (state.audio_initialized) {
+        ma_device_start(&g_audio_device);
+    }
     
     // Initialize Native File Dialog
     NFD_Init();
@@ -1678,9 +1692,9 @@ void cleanup(void) {
         midi_state.soundfont = nullptr;
     }
     
-    // Cleanup sokol_audio
+    // Cleanup miniaudio
     if (state.audio_initialized) {
-        saudio_shutdown();
+        ma_device_uninit(&g_audio_device);
     }
     
     // Cleanup Native File Dialog
